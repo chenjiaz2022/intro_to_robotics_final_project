@@ -15,11 +15,12 @@ setup(
     zip_safe=True,
     maintainer='chenjiaz',
     maintainer_email='chenjiaz2022@gmail.com',
-    description='TODO: Package description',
+    description='Package for Final Project',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'final-project = intro_to_robotics_final_project.final_project:main',
         ],
     },
 )
