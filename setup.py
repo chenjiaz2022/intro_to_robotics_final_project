@@ -21,8 +21,8 @@ setup(
     entry_points={
         'console_scripts': [
             'final-project = intro_to_robotics_final_project.final_project:main',
-            'gesture = intro_to_robotics_final_project.Gesture:main',
-            'gesture-training = intro_to_robotics_final_project.GestureTraining:main',
+            'gesture = intro_to_robotics_final_project.gesture:main',
+            'gesture-training = intro_to_robotics_final_project.gestureTraining:main',
         ],
     },
 )

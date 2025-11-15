@@ -1,6 +1,7 @@
 import os
 import cv2 as cv
 import numpy as np
+from pythonosc import udp_client
 import mediapipe.python.solutions.hands as mp_hands
 import mediapipe.python.solutions.drawing_utils as drawing
 import mediapipe.python.solutions.drawing_styles as drawing_styles
@@ -8,39 +9,37 @@ import mediapipe.python.solutions.drawing_styles as drawing_styles
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 import cv_bridge
 
-# Initialize the Hands model
+client = udp_client.SimpleUDPClient("127.0.0.1", 3333)
+
+# Load dataset
+data = np.load("gesture_dataset.npz")
+X_train = data["X"]  # shape (N, 63)
+y_train = data["y"]  # shape (N,)
+model_trained = True
+
+print(f"Loaded dataset: {X_train.shape[0]} samples")
+
+# Initialize Hands model
 hands = mp_hands.Hands(
     static_image_mode=False,
     max_num_hands=2,
     min_detection_confidence=0.5
 )
 
-# Training storage
-training_data = []   # list of feature vectors
-training_labels = [] # list of ints (0,1,2,3)
-
-current_features = {"left": None, "right": None}
-
-
 def landmarks_to_feature(hand_landmarks):
-    """
-    Convert MediaPipe hand landmarks to a normalized feature vector.
-    21 points -> 63 values (x,y,z normalized).
-    """
     lm = hand_landmarks.landmark
     xs = np.array([p.x for p in lm])
     ys = np.array([p.y for p in lm])
     zs = np.array([p.z for p in lm])
 
-    # Use wrist as origin
     x0, y0, z0 = xs[0], ys[0], zs[0]
     xs = xs - x0
     ys = ys - y0
     zs = zs - z0
 
-    # Normalize by max distance from wrist
     norms = np.sqrt(xs**2 + ys**2 + zs**2)
     max_norm = np.max(norms)
     if max_norm > 0:
@@ -51,10 +50,29 @@ def landmarks_to_feature(hand_landmarks):
     feature = np.concatenate([xs, ys, zs], axis=0)
     return feature.astype(np.float32)
 
+def predict_gesture(feature, k=5):
+    if not model_trained or X_train is None or y_train is None:
+        return "none"
 
-class GestureDatasetCollector(Node):
+    n_samples = X_train.shape[0]
+    if n_samples == 0:
+        return "none"
+
+    k = min(k, n_samples)
+
+    diffs = X_train - feature
+    dists = np.linalg.norm(diffs, axis=1)
+
+    knn_idx = np.argsort(dists)[:k]
+    knn_labels = y_train[knn_idx]
+
+    values, counts = np.unique(knn_labels, return_counts=True)
+    majority_label = values[np.argmax(counts)]
+    return str(int(majority_label))
+
+class GestureRecognizer(Node):
     def __init__(self):
-        super().__init__('gesture_dataset_collector')
+        super().__init__('gesture_recognizer')
 
         # Get ROS_DOMAIN_ID (same style as in main.py)
         ros_domain_id = os.getenv("ROS_DOMAIN_ID", "0")
@@ -74,30 +92,32 @@ class GestureDatasetCollector(Node):
             Image, self.image_topic, self.image_callback, 10
         )
 
-        cv.namedWindow("Dataset Collector", 1)
+        # Publish recognized gesture as ROS topic
+        self.gesture_topic = f'/tb{ros_domain_id}/hand_movement'
+        self.gesture_pub = self.create_publisher(String, self.gesture_topic, 10)
+
+        cv.namedWindow("Real-time Gesture", 1)
 
         self.get_logger().info(
-            f"Hand Gesture Dataset Collector using {self.image_topic}. "
-            "Show gesture 0/2/5 and press that key to record."
+            f"Real-time Hand Gesture Recognition using {self.image_topic}. "
+            f"Publishing gestures to {self.gesture_topic}. Press 'q' in the window to quit."
         )
 
     def image_callback(self, msg: Image):
-        global current_features, training_data, training_labels
-
+        # Convert ROS image to OpenCV BGR frame
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
         frame_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
         hands_detected = hands.process(frame_rgb)
 
-        current_features["left"] = None
-        current_features["right"] = None
+        movements = {'left': "none", 'right': "none"}
 
         if hands_detected.multi_hand_landmarks:
             for hand_landmarks, hand_class in zip(
                 hands_detected.multi_hand_landmarks,
                 hands_detected.multi_handedness
             ):
-                hand_label = hand_class.classification[0].label.lower()  # 'left' or 'right'
+                hand_label = hand_class.classification[0].label.lower()
 
                 drawing.draw_landmarks(
                     frame,
@@ -108,53 +128,40 @@ class GestureDatasetCollector(Node):
                 )
 
                 feat = landmarks_to_feature(hand_landmarks)
-                current_features[hand_label] = feat
+                gesture = predict_gesture(feat)
+                movements[hand_label] = gesture
 
-        cv.putText(frame, "Press 0/2/5 to add sample, 's' to save, 'q' to quit.",
-                   (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv.imshow("Dataset Collector", frame)
+        # Decide what to send
+        detected_gestures = [g for g in movements.values() if g != "none"]
+        if detected_gestures:
+            gesture_message = detected_gestures[0]
+        else:
+            gesture_message = "none"
 
-        key = cv.waitKey(20) & 0xFF
+        # Publish via ROS
+        msg_out = String()
+        msg_out.data = gesture_message
+        self.gesture_pub.publish(msg_out)
+
+        # Send via OSC if some other system needs it
+        client.send_message("/hand_movement", gesture_message)
+
+        debug_message = f"left hand {movements['left']}, right hand {movements['right']}"
+        cv.putText(frame, debug_message, (10, 30),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv.imshow("Real-time Gesture", frame)
+        print(debug_message, "-> sent:", gesture_message)
+
+        key = cv.waitKey(5) & 0xFF
         if key == ord('q'):
-            self.get_logger().info("Quitting dataset collection.")
+            self.get_logger().info("Exiting gesture recognizer.")
             rclpy.shutdown()
-            return
-
-        if key in [ord('0'), ord('2'), ord('5')]:
-            label = int(chr(key))
-            saved_any = False
-            for side in ["left", "right"]:
-                feat = current_features[side]
-                if feat is not None:
-                    training_data.append(feat)
-                    training_labels.append(label)
-                    saved_any = True
-            if saved_any:
-                print(f"Added sample(s) for label {label}. Total: {len(training_labels)}")
-            else:
-                print("No hand detected when you pressed the key, nothing saved.")
-
-        if key == ord('s'):
-            if len(training_labels) == 0:
-                print("No samples to save yet.")
-            else:
-                X = np.vstack(training_data)
-                y = np.array(training_labels, dtype=np.int32)
-                np.savez("Gesture_dataset.npz", X=X, y=y)
-                print(f"Saved dataset with {len(y)} samples to Gesture_dataset.npz")
-
-
-print("Hand Gesture Dataset Collector")
-print("Show gesture 0/2/5 to the camera, then press that number key to record a sample.")
-print("Keys:")
-print("  0/2/5 -> add training sample with that label")
-print("  s       -> save dataset to Gesture_dataset.npz")
-print("  q       -> quit")
-
 
 def main(args=None):
+    print("Real-time Hand Gesture Recognition (Robot Camera)")
+    print("Press 'q' in the image window to quit.")
     rclpy.init(args=args)
-    node = GestureDatasetCollector()
+    node = GestureRecognizer()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -164,7 +171,6 @@ def main(args=None):
         cv.destroyAllWindows()
         if rclpy.ok():
             rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

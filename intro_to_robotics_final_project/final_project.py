@@ -12,7 +12,6 @@ from std_msgs.msg import String
 import cv2
 import cv_bridge
 
-
 class FinalProject(Node):
     def __init__(self):
         super().__init__('final_project')
@@ -51,7 +50,7 @@ class FinalProject(Node):
             CompressedImage, self.image_topic, self.image_callback, 10
         )
 
-        # Gesture subscriber (from Gesture.py)
+        # Gesture subscriber (from gesture.py)
         self.gesture_topic = f'/tb{ros_domain_id}/hand_movement'
         self.gesture_sub = self.create_subscription(
             String, self.gesture_topic, self.gesture_callback, 10
@@ -78,10 +77,14 @@ class FinalProject(Node):
         self.current_gesture = "none"
         self.target_tag = -1
         self.pending_return_tag = -1
+        # For gesture debouncing: require same gesture for 3 seconds
+        self.last_gesture_raw = None
+        self.last_gesture_time = None
+        
         # 0 means idle, 1 means looking for AR tags and approaching
         self.next_goal = 0
 
-        # --- parameter for area-based stopping (fraction of image area) ---
+        # Parameter for area-based stopping (fraction of image area)
         self.min_tag_area_percent = 0.14  # 14% of the image area as in previous project
 
         # Initialize Arm to initial position (optional) -> comment for now
@@ -138,7 +141,7 @@ class FinalProject(Node):
                 # tags[tag_id] = ((cx, cy), area)
                 (cx_tag, cy_tag), area = tags[self.target_tag]
 
-                # Small bias if you want (as before)
+                # Small bias
                 cx_tag -= 5
 
                 # P-controller on horizontal error
@@ -151,7 +154,7 @@ class FinalProject(Node):
 
                 start_sequence = False
 
-                # --- NEW: area-based stopping condition, like in TAG phase before ---
+                # Area-based stopping condition, like in TAG phase before
                 total_pixels = float(h * w)
                 min_tag_area = total_pixels * self.min_tag_area_percent
                 area_percent = (area / total_pixels) * 100.0
@@ -166,7 +169,7 @@ class FinalProject(Node):
                         f"{area_percent:.1f}% of image)."
                     )
 
-                # Optional extra safety: never drive forward if LiDAR says too close
+                # Never drive forward if LiDAR says too close
                 if self.front_dist < 0.25:
                     lin_x = 0.0
 
@@ -210,11 +213,40 @@ class FinalProject(Node):
             return
 
         gesture = msg.data.strip()
+
+        # If gesture is not one of the valid ones, reset and ignore
         if gesture not in ("0", "2", "5"):
+            self.last_gesture_raw = None
+            self.last_gesture_time = None
             return
 
+        now = time.time()
+
+        # If gesture changed, start timing from now
+        if gesture != self.last_gesture_raw:
+            self.last_gesture_raw = gesture
+            self.last_gesture_time = now
+            # Not stable yet, just start the timer
+            return
+
+        # Check how long it's been stable
+        if self.last_gesture_time is None:
+            # Shouldn't really happen, but be safe
+            self.last_gesture_time = now
+            return
+
+        elapsed = now - self.last_gesture_time
+        if elapsed < 3.0:
+            # Need at least 3 seconds of the same gesture
+            return
+
+        # At this point, the same valid gesture has been observed for >= 3 seconds
+        # Accept it and reset the timer so we don't immediately re-trigger
+        self.last_gesture_raw = None
+        self.last_gesture_time = None
+
         self.current_gesture = gesture
-        self.get_logger().info(f"Received gesture {gesture}")
+        self.get_logger().info(f"Recognized gesture {gesture} (stable for {elapsed:.1f} s)")
 
         if gesture == "0":
             self.target_tag = 3
@@ -340,7 +372,6 @@ class FinalProject(Node):
         """Stop the robot by publishing zero velocity."""
         self.cmd_pub.publish(Twist())
 
-
 def main(args=None):
     rclpy.init(args=args)
     node = FinalProject()
@@ -353,7 +384,6 @@ def main(args=None):
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
