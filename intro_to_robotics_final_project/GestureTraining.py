@@ -12,7 +12,7 @@ hands = mp_hands.Hands(
 )
 
 # Open the camera
-cam = cv.VideoCapture(0)
+cam = cv.VideoCapture(1)
 
 # Training storage
 training_data = []   # list of feature vectors
@@ -49,9 +49,9 @@ def landmarks_to_feature(hand_landmarks):
 
 
 print("Hand Gesture Dataset Collector")
-print("Show gesture 0/1/2/3 to the camera, then press that number key to record a sample.")
+print("Show gesture 0/2/5 to the camera, then press that number key to record a sample.")
 print("Keys:")
-print("  0/1/2/3 -> add training sample with that label")
+print("  0/2/5 -> add training sample with that label")
 print("  s       -> save dataset to hand_gesture_dataset.npz")
 print("  q       -> quit")
 
@@ -85,7 +85,7 @@ while cam.isOpened():
             feat = landmarks_to_feature(hand_landmarks)
             current_features[hand_label] = feat
 
-    cv.putText(frame, "Press 0/1/2/3 to add sample, 's' to save, 'q' to quit.",
+    cv.putText(frame, "Press 0/2/5 to add sample, 's' to save, 'q' to quit.",
                (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
     cv.imshow("Dataset Collector", frame)
 
@@ -93,7 +93,7 @@ while cam.isOpened():
     if key == ord('q'):
         break
 
-    if key in [ord('0'), ord('1'), ord('2'), ord('3')]:
+    if key in [ord('0'), ord('2'), ord('5')]:
         label = int(chr(key))
         saved_any = False
         for side in ["left", "right"]:
