@@ -1,9 +1,17 @@
+import os
 import cv2 as cv
 import numpy as np
 from pythonosc import udp_client
 import mediapipe.python.solutions.hands as mp_hands
 import mediapipe.python.solutions.drawing_utils as drawing
 import mediapipe.python.solutions.drawing_styles as drawing_styles
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+import cv_bridge
+
 
 client = udp_client.SimpleUDPClient("127.0.0.1", 3333)
 
@@ -22,8 +30,6 @@ hands = mp_hands.Hands(
     min_detection_confidence=0.5
 )
 
-# Open camera
-cam = cv.VideoCapture(1)
 
 def landmarks_to_feature(hand_landmarks):
     lm = hand_landmarks.landmark
@@ -46,6 +52,7 @@ def landmarks_to_feature(hand_landmarks):
     feature = np.concatenate([xs, ys, zs], axis=0)
     return feature.astype(np.float32)
 
+
 def predict_gesture(feature, k=5):
     if not model_trained or X_train is None or y_train is None:
         return "none"
@@ -66,57 +73,110 @@ def predict_gesture(feature, k=5):
     majority_label = values[np.argmax(counts)]
     return str(int(majority_label))
 
-print("Real-time Hand Gesture Recognition")
-print("Press 'q' to quit.")
 
-while cam.isOpened():
-    success, frame = cam.read()
-    if not success:
-        print("Camera frame not available")
-        continue
+class GestureRecognizer(Node):
+    def __init__(self):
+        super().__init__('gesture_recognizer')
 
-    frame_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
-    hands_detected = hands.process(frame_rgb)
+        # Get ROS_DOMAIN_ID (same style as in main.py)
+        ros_domain_id = os.getenv("ROS_DOMAIN_ID", "0")
+        try:
+            if int(ros_domain_id) < 10:
+                ros_domain_id = "0" + str(int(ros_domain_id))
+            else:
+                ros_domain_id = str(int(ros_domain_id))
+        except Exception:
+            ros_domain_id = "00"
 
-    movements = {'left': "none", 'right': "none"}
+        self.bridge = cv_bridge.CvBridge()
 
-    if hands_detected.multi_hand_landmarks:
-        for hand_landmarks, hand_class in zip(
-            hands_detected.multi_hand_landmarks,
-            hands_detected.multi_handedness
-        ):
-            hand_label = hand_class.classification[0].label.lower()
+        # Subscribe to robot camera topic (robot camera, not computer webcam)
+        self.image_topic = f'/tb{ros_domain_id}/oakd/rgb/preview/image_raw'
+        self.image_sub = self.create_subscription(
+            Image, self.image_topic, self.image_callback, 10
+        )
 
-            drawing.draw_landmarks(
-                frame,
-                hand_landmarks,
-                mp_hands.HAND_CONNECTIONS,
-                drawing_styles.get_default_hand_landmarks_style(),
-                drawing_styles.get_default_hand_connections_style(),
-            )
+        # Publish recognized gesture as ROS topic
+        self.gesture_topic = f'/tb{ros_domain_id}/hand_movement'
+        self.gesture_pub = self.create_publisher(String, self.gesture_topic, 10)
 
-            feat = landmarks_to_feature(hand_landmarks)
-            gesture = predict_gesture(feat)
-            movements[hand_label] = gesture
+        cv.namedWindow("Real-time Gesture", 1)
 
-    # Decide what to send
-    detected_gestures = [g for g in movements.values() if g != "none"]
-    if detected_gestures:
-        gesture_message = detected_gestures[0]
-    else:
-        gesture_message = "none"
+        self.get_logger().info(
+            f"Real-time Hand Gesture Recognition using {self.image_topic}. "
+            f"Publishing gestures to {self.gesture_topic}. Press 'q' in the window to quit."
+        )
 
-    client.send_message("/hand_movement", gesture_message)
+    def image_callback(self, msg: Image):
+        # Convert ROS image to OpenCV BGR frame
+        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
-    debug_message = f"left hand {movements['left']}, right hand {movements['right']}"
-    cv.putText(frame, debug_message, (10, 30),
-               cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    cv.imshow("Real-time Gesture", frame)
-    print(debug_message, "-> sent:", gesture_message)
+        frame_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+        hands_detected = hands.process(frame_rgb)
 
-    key = cv.waitKey(20) & 0xFF
-    if key == ord('q'):
-        break
+        movements = {'left': "none", 'right': "none"}
 
-cam.release()
-cv.destroyAllWindows()
+        if hands_detected.multi_hand_landmarks:
+            for hand_landmarks, hand_class in zip(
+                hands_detected.multi_hand_landmarks,
+                hands_detected.multi_handedness
+            ):
+                hand_label = hand_class.classification[0].label.lower()
+
+                drawing.draw_landmarks(
+                    frame,
+                    hand_landmarks,
+                    mp_hands.HAND_CONNECTIONS,
+                    drawing_styles.get_default_hand_landmarks_style(),
+                    drawing_styles.get_default_hand_connections_style(),
+                )
+
+                feat = landmarks_to_feature(hand_landmarks)
+                gesture = predict_gesture(feat)
+                movements[hand_label] = gesture
+
+        # Decide what to send
+        detected_gestures = [g for g in movements.values() if g != "none"]
+        if detected_gestures:
+            gesture_message = detected_gestures[0]
+        else:
+            gesture_message = "none"
+
+        # Publish via ROS
+        msg_out = String()
+        msg_out.data = gesture_message
+        self.gesture_pub.publish(msg_out)
+
+        # (Optional) still send via OSC if some other system needs it
+        client.send_message("/hand_movement", gesture_message)
+
+        debug_message = f"left hand {movements['left']}, right hand {movements['right']}"
+        cv.putText(frame, debug_message, (10, 30),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv.imshow("Real-time Gesture", frame)
+        print(debug_message, "-> sent:", gesture_message)
+
+        key = cv.waitKey(5) & 0xFF
+        if key == ord('q'):
+            self.get_logger().info("Exiting gesture recognizer.")
+            rclpy.shutdown()
+
+
+def main(args=None):
+    print("Real-time Hand Gesture Recognition (Robot Camera)")
+    print("Press 'q' in the image window to quit.")
+    rclpy.init(args=args)
+    node = GestureRecognizer()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        cv.destroyAllWindows()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
