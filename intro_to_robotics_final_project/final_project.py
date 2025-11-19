@@ -12,6 +12,7 @@ from std_msgs.msg import String
 import cv2
 import cv_bridge
 
+
 class FinalProject(Node):
     def __init__(self):
         super().__init__('final_project')
@@ -42,9 +43,12 @@ class FinalProject(Node):
         self.bridge = cv_bridge.CvBridge()
         cv2.namedWindow("window", 1)
 
-        # Set up subscribers
+        # Set up subscribers  ✅ topic first, then callback
         self.scan_topic = f'/tb{ros_domain_id}/scan'
-        self.laser_sub = self.create_subscription(LaserScan, self.scan_topic, self.scan_callback, 10)
+        self.laser_sub = self.create_subscription(
+            LaserScan, self.scan_topic, self.scan_callback, 10
+        )
+
         self.image_topic = f'/tb{ros_domain_id}/oakd/rgb/preview/image_raw/compressed'
         self.image_sub = self.create_subscription(
             CompressedImage, self.image_topic, self.image_callback, 10
@@ -59,6 +63,8 @@ class FinalProject(Node):
 
         # Useful attributes
         self.front_dist = 10.0
+        self.left_dist = 10.0
+        self.right_dist = 10.0
         self.next_task = None
 
         # Controller params for AR tag approach
@@ -80,14 +86,20 @@ class FinalProject(Node):
         # For gesture debouncing: require same gesture for 3 seconds
         self.last_gesture_raw = None
         self.last_gesture_time = None
-        
+
         # 0 means idle, 1 means looking for AR tags and approaching
         self.next_goal = 0
 
         # Parameter for area-based stopping (fraction of image area)
-        self.min_tag_area_percent = 0.14  # 14% of the image area as in previous project
+        self.min_tag_area_percent = 0.14  # 14% of the image area
 
-        # Initialize Arm to initial position (optional) -> comment for now
+        # Obstacle-avoidance state machine for "no-tag" search
+        self.nav_mode = "search_straight"
+        self.avoid_side = 1  # +1 = left, -1 = right
+        self.avoid_phase_start = 0.0
+        self.search_start_time = None
+
+        # Initialize Arm to initial position (optional)
         # joint_msg = ArmJointAngles(joint1=0.0, joint2=0.0, joint3=0.0, joint4=0.0)
         # self.arm_pub.publish(joint_msg)
         # time.sleep(2)
@@ -95,22 +107,234 @@ class FinalProject(Node):
 
         # self.task1_arm()
 
-    def scan_callback(self, msg):
+    def scan_callback(self, msg: LaserScan):
         """
-        Function used to detect distance between the object and the turtlebot.
-        We keep this as an extra safety signal (e.g., could be used to clamp speed),
-        but we no longer use it as the main stopping condition.
+        Use LiDAR to detect distances in front and slightly to left/right.
+        This is used for obstacle avoidance when no AR tag is visible.
         """
-        mid = len(msg.ranges) // 4
-        current_ranges_array = np.asarray(msg.ranges)
-        current_ranges_array[current_ranges_array < 0.2] = 100
-        min_front_dist = np.min(current_ranges_array[mid - 10: mid + 10])
-        self.front_dist = float(min_front_dist)
+        ranges = np.asarray(msg.ranges, dtype=float)
 
-    def image_callback(self, msg):
+        # Replace invalid/too-small readings with a large number
+        ranges[ranges < 0.2] = 100.0
+
+        n = len(ranges)
+        mid = n // 4
+
+        # Helper to clamp indices
+        def clamp_slice(start, end):
+            start = max(0, start)
+            end = min(n, end)
+            if start >= end:
+                return np.array([100.0])
+            return ranges[start:end]
+
+        # "Front" sector: narrow slice in the middle
+        front_slice = clamp_slice(mid - 10, mid + 10)
+        self.front_dist = float(np.min(front_slice))
+
+        # Slightly off-center left and right sectors for choosing avoidance direction
+        left_slice = clamp_slice(mid + 20, mid + 60)
+        right_slice = clamp_slice(mid - 60, mid - 20)
+
+        self.left_dist = float(np.min(left_slice))
+        self.right_dist = float(np.min(right_slice))
+        
+    def _do_obstacle_avoidance(self, use_initial_straight: bool):
+        """
+        One step of obstacle avoidance state machine.
+
+        use_initial_straight:
+          - True  -> use the initial straight phase (for 'searching' with no tag).
+          - False -> skip initial straight, immediately avoid (for 'tag visible but blocked').
+        """
+        twist = Twist()
+
+        # Parameters
+        safe_front_dist = 0.55      # "object on that line" threshold
+        forward_speed   = 0.10      # straight-line speed
+        turn_speed      = 0.5       # turning speed
+        phase_turn_time = 3.0       # turn duration for each corner
+        phase_fwd_time  = 4.0       # forward duration for bypass segments
+        initial_straight_time = 1.0
+
+        now = time.time()
+
+        # Emergency stop if something is extremely close
+        if self.front_dist < 0.22:
+            twist.linear.x = 0.0
+            twist.angular.z = 0.0
+            self.cmd_pub.publish(twist)
+            return
+
+        # Optional initial straight-line phase (used only for "search" mode)
+        if use_initial_straight:
+            if self.search_start_time is None:
+                self.search_start_time = now
+            elapsed_search = now - self.search_start_time
+
+            if elapsed_search < initial_straight_time:
+                # Go straight, minimal safety stop only if REALLY close
+                twist.linear.x = forward_speed
+                twist.angular.z = 0.0
+
+                if self.front_dist < 0.20:
+                    twist.linear.x = 0.0
+
+                self.cmd_pub.publish(twist)
+                return
+
+            # After initial straight finished, one more close-stop check
+            if self.front_dist < 0.22:
+                twist.linear.x = 0.0
+                twist.angular.z = 0.0
+                self.cmd_pub.publish(twist)
+                return
+        else:
+            # For tag-visible avoidance, we don't use the straight-search timer
+            self.search_start_time = None
+
+        # State machine for rectangle-like avoidance path:
+        # turn → forward → parallel → turn back → forward
+        now = time.time()
+
+        if self.nav_mode == "search_straight":
+            if use_initial_straight:
+                # Normal search mode: straight until obstacle
+                if self.front_dist > safe_front_dist:
+                    twist.linear.x = forward_speed
+                    twist.angular.z = 0.0
+                else:
+                    self.get_logger().info("obstacle")
+                    # Obstacle in front → start rectangle
+                    if self.left_dist > self.right_dist:
+                        self.avoid_side = 1   # turn left
+                    else:
+                        self.avoid_side = -1  # turn right
+
+                    self.nav_mode = "avoid_turn1"
+                    self.avoid_phase_start = now
+
+                    twist.linear.x = 0.0
+                    twist.angular.z = turn_speed * self.avoid_side
+            else:
+                # Tag-visible case: we *already* decided obstacle is in front,
+                # so don't go straight; immediately start the turn.
+                if self.left_dist > self.right_dist:
+                    self.avoid_side = 1
+                else:
+                    self.avoid_side = -1
+                self.nav_mode = "avoid_turn1"
+                self.avoid_phase_start = now
+
+                twist.linear.x = 0.0
+                twist.angular.z = turn_speed * self.avoid_side
+
+        elif self.nav_mode == "avoid_turn1":
+            # First corner: rotate away from obstacle
+            if now - self.avoid_phase_start < phase_turn_time:
+                twist.linear.x = 0.0
+                twist.angular.z = turn_speed * self.avoid_side
+            else:
+                self.nav_mode = "avoid_forward1"
+                self.avoid_phase_start = now
+                twist.linear.x = forward_speed
+                twist.angular.z = 0.0
+
+        elif self.nav_mode == "avoid_forward1":
+            # Move in that direction (first forward edge)
+            if now - self.avoid_phase_start < phase_fwd_time:
+                twist.linear.x = forward_speed
+                twist.angular.z = 0.0
+            else:
+                self.nav_mode = "avoid_turn2"
+                self.avoid_phase_start = now
+                twist.linear.x = 0.0
+                twist.angular.z = -turn_speed * self.avoid_side
+
+        elif self.nav_mode == "avoid_turn2":
+            # Turn back to be parallel to original line
+            if now - self.avoid_phase_start < phase_turn_time:
+                twist.linear.x = 0.0
+                twist.angular.z = -turn_speed * self.avoid_side
+            else:
+                self.nav_mode = "avoid_forward2"
+                self.avoid_phase_start = now
+                twist.linear.x = forward_speed
+                twist.angular.z = 0.0
+        
+        # elif self.nav_mode == "avoid_forward2":
+        #     # Move forward to re-enter (approximately) the original straight line
+        #     if now - self.avoid_phase_start < phase_fwd_time:
+        #         twist.linear.x = forward_speed
+        #         twist.angular.z = 0.0
+        #     else:
+        #         # Back to straight mode
+        #         self.nav_mode = "search_straight"
+        #         twist.linear.x = forward_speed
+        #         twist.angular.z = 0.0
+
+        elif self.nav_mode == "avoid_forward2":
+            # Move parallel to the original line (passing the obstacle)
+            if now - self.avoid_phase_start < phase_fwd_time:
+                twist.linear.x = forward_speed
+                twist.angular.z = 0.0
+            else:
+                # Now start coming back toward the original line
+                self.nav_mode = "avoid_turn3"
+                self.avoid_phase_start = now
+                twist.linear.x = 0.0
+                twist.angular.z = -turn_speed * self.avoid_side
+
+        elif self.nav_mode == "avoid_turn3":
+            # Turn to head back toward the original straight line
+            if now - self.avoid_phase_start < phase_turn_time:
+                twist.linear.x = 0.0
+                twist.angular.z = -turn_speed * self.avoid_side
+            else:
+                self.nav_mode = "avoid_forward3"
+                self.avoid_phase_start = now
+                twist.linear.x = forward_speed
+                twist.angular.z = 0.0
+
+        elif self.nav_mode == "avoid_forward3":
+            # Move sideways back toward the original straight line
+            if now - self.avoid_phase_start < phase_fwd_time:
+                twist.linear.x = forward_speed
+                twist.angular.z = 0.0
+            else:
+                # Final turn to restore original heading
+                self.nav_mode = "avoid_turn4"
+                self.avoid_phase_start = now
+                twist.linear.x = 0.0
+                twist.angular.z = turn_speed * self.avoid_side
+
+        elif self.nav_mode == "avoid_turn4":
+            # Turn back to the original orientation
+            if now - self.avoid_phase_start < phase_turn_time:
+                twist.linear.x = 0.0
+                twist.angular.z = turn_speed * self.avoid_side
+            else:
+                # Finished the rectangle; back to straight mode
+                self.nav_mode = "search_straight"
+                twist.linear.x = forward_speed
+                twist.angular.z = 0.0
+
+        else:
+            # Fallback
+            self.nav_mode = "search_straight"
+            twist.linear.x = forward_speed
+            twist.angular.z = 0.0
+
+        self.cmd_pub.publish(twist)
+
+    def image_callback(self, msg: CompressedImage):
         """
         Use camera to detect AR tags and move toward the tag chosen by the gesture.
-        Stopping condition is now based on the proportion of the image occupied by the tag.
+        Stopping condition is based on the proportion of the image occupied by the tag.
+
+        When tag is not visible but we have a navigation goal, we do:
+          - Straight-line search forward
+          - Obstacle avoidance only for obstacles directly in front
         """
         image = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
@@ -138,6 +362,17 @@ class FinalProject(Node):
 
             # If target tag detected
             if self.target_tag in tags:
+                # If obstacle is still on the way, first move around it
+                safe_front_dist = 0.45  # same threshold as in avoidance
+                if self.front_dist <= safe_front_dist:
+                    # Do avoidance WITHOUT initial straight phase (tag is visible)
+                    self._do_obstacle_avoidance(use_initial_straight=False)
+                    return
+
+                # No obstacle blocking -> track tag normally
+                self.nav_mode = "search_straight"
+                self.search_start_time = None
+
                 # tags[tag_id] = ((cx, cy), area)
                 (cx_tag, cy_tag), area = tags[self.target_tag]
 
@@ -154,7 +389,7 @@ class FinalProject(Node):
 
                 start_sequence = False
 
-                # Area-based stopping condition, like in TAG phase before
+                # Area-based stopping condition
                 total_pixels = float(h * w)
                 min_tag_area = total_pixels * self.min_tag_area_percent
                 area_percent = (area / total_pixels) * 100.0
@@ -181,23 +416,17 @@ class FinalProject(Node):
 
                 # Only advance/chain goals once we consider the tag "reached"
                 if start_sequence:
-                    if self.pending_return_tag != -1:
-                        # e.g., gesture "5": go to tag 2, then back to tag 1
-                        self.target_tag = self.pending_return_tag
-                        self.pending_return_tag = -1
-                        self.next_goal = 1
-                        self.get_logger().info('Starting return to tag 1 after reaching tag 2.')
-                    else:
-                        # Done with this goal
-                        self.next_goal = 0
-                        self.target_tag = -1
+                    # Once at the AR tag, stop and wait for later commands
+                    self.next_goal = 0
+                    self.target_tag = -1
+                    self.pending_return_tag = -1
+                    self.current_gesture = "none"
+                    self.nav_mode = "search_straight"
+                    self.search_start_time = None
 
             else:
-                # Rotate to search for tag
-                twist = Twist()
-                twist.angular.z = 0.25
-                twist.linear.x = 0.0
-                self.cmd_pub.publish(twist)
+                # Tag not detected -> straight-line search + obstacle avoidance
+                self._do_obstacle_avoidance(use_initial_straight=True)
 
     def gesture_callback(self, msg: String):
         """
@@ -259,6 +488,8 @@ class FinalProject(Node):
             self.pending_return_tag = 1
 
         self.next_goal = 1
+        # Reset nav_mode when starting a new goal
+        self.nav_mode = "search_straight"
 
     def _detect_aruco(self, bgr):
         """
@@ -308,7 +539,7 @@ class FinalProject(Node):
             pts = corners[i][0] if len(corners[i].shape) == 3 else corners[i]
             cx = int(np.mean(pts[:, 0]))
             cy = int(np.mean(pts[:, 1]))
-            area = float(cv2.contourArea(pts))  # NEW: area of the tag polygon
+            area = float(cv2.contourArea(pts))  # area of the tag polygon
             if tid in (1, 2, 3):
                 # Store center and area
                 out[int(tid)] = ((cx, cy), area)
