@@ -414,15 +414,23 @@ class FinalProject(Node):
                 twist.angular.z = ang_z
                 self.cmd_pub.publish(twist)
 
-                # Only advance/chain goals once we consider the tag "reached"
                 if start_sequence:
-                    # Once at the AR tag, stop and wait for later commands
-                    self.next_goal = 0
-                    self.target_tag = -1
-                    self.pending_return_tag = -1
-                    self.current_gesture = "none"
-                    self.nav_mode = "search_straight"
-                    self.search_start_time = None
+                    if self.pending_return_tag != -1:
+                        # e.g., gesture "5": go to tag 2, then back to tag 1
+                        self.target_tag = self.pending_return_tag
+                        self.pending_return_tag = -1
+                        self.next_goal = 1
+                        self.nav_mode = "search_straight"
+                        self.search_start_time = None
+                        self.get_logger().info('Starting return to tag 1 after reaching tag 2.')
+                    else:
+                        # Done with this goal
+                        self.next_goal = 0
+                        self.target_tag = -1
+                        self.pending_return_tag = -1
+                        self.current_gesture = "none"
+                        self.nav_mode = "search_straight"
+                        self.search_start_time = None
 
             else:
                 # Tag not detected -> straight-line search + obstacle avoidance
