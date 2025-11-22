@@ -43,7 +43,7 @@ class FinalProject(Node):
         self.bridge = cv_bridge.CvBridge()
         cv2.namedWindow("window", 1)
 
-        # Set up subscribers  ✅ topic first, then callback
+        # Set up subscribers. topic first, then callback
         self.scan_topic = f'/tb{ros_domain_id}/scan'
         self.laser_sub = self.create_subscription(
             LaserScan, self.scan_topic, self.scan_callback, 10
@@ -66,6 +66,7 @@ class FinalProject(Node):
         self.left_dist = 10.0
         self.right_dist = 10.0
         self.next_task = None
+        self.cy_tag = 0
 
         # Controller params for AR tag approach
         self.k_ang = 0.0025
@@ -90,6 +91,10 @@ class FinalProject(Node):
         # 0 means idle, 1 means looking for AR tags and approaching
         self.next_goal = 0
 
+        # 1 means resting in the corner, 2 means dancing with the user
+        # 3 means grabbing the bottle, 4 means putting down the bottle
+        self.current_task = 0
+
         # Parameter for area-based stopping (fraction of image area)
         self.min_tag_area_percent = 0.14  # 14% of the image area
 
@@ -99,13 +104,16 @@ class FinalProject(Node):
         self.avoid_phase_start = 0.0
         self.search_start_time = None
 
-        # Initialize Arm to initial position (optional)
-        # joint_msg = ArmJointAngles(joint1=0.0, joint2=0.0, joint3=0.0, joint4=0.0)
-        # self.arm_pub.publish(joint_msg)
-        # time.sleep(2)
-        # self.get_logger().info(f'Arm Initialized')
+        # Initialize Arm and Gripper to initial position
+        joint_msg = ArmJointAngles(joint1=0.0, joint2=0.0, joint3=0.0, joint4=0.0)
+        self.arm_pub.publish(joint_msg)
+        time.sleep(2)
+        self.get_logger().info(f'Arm Initialized')
 
-        # self.task1_arm()
+        gripper_msg = ArmGripperPosition(left_gripper=0.010, right_gripper=0.010)
+        self.gripper_pub.publish(gripper_msg)
+        time.sleep(2)
+        self.get_logger().info('Gripper Openned')
 
     def scan_callback(self, msg: LaserScan):
         """
@@ -375,6 +383,7 @@ class FinalProject(Node):
 
                 # tags[tag_id] = ((cx, cy), area)
                 (cx_tag, cy_tag), area = tags[self.target_tag]
+                self.cy_tag = cy_tag
 
                 # Small bias
                 cx_tag -= 5
@@ -414,15 +423,50 @@ class FinalProject(Node):
                 twist.angular.z = ang_z
                 self.cmd_pub.publish(twist)
 
-                # Only advance/chain goals once we consider the tag "reached"
                 if start_sequence:
-                    # Once at the AR tag, stop and wait for later commands
-                    self.next_goal = 0
-                    self.target_tag = -1
-                    self.pending_return_tag = -1
-                    self.current_gesture = "none"
-                    self.nav_mode = "search_straight"
-                    self.search_start_time = None
+                    if self.pending_return_tag != -1:
+                        # e.g., gesture "5": go to tag 2, then back to tag 1
+                        self.target_tag = self.pending_return_tag
+                        self.pending_return_tag = -1
+                        self.next_goal = 1
+                        self.nav_mode = "search_straight"
+                        self.search_start_time = None
+                        self.get_logger().info('Starting return to tag 1 after reaching tag 2.')
+
+                        if self.current_task == 1:
+                            self.arm_resting()
+                            self.current_task = 0
+                        elif self.current_task == 2:
+                            self.arm_dancing()
+                            self.current_task = 0
+                        elif self.current_task == 3:
+                            self.arm_grabbing()
+                            self.current_task = 4
+                        else:
+                            self.arm_releasing()
+                            self.current_task = 0
+                    
+                    else:
+                        # Done with this goal
+                        self.next_goal = 0
+                        self.target_tag = -1
+                        self.pending_return_tag = -1
+                        self.current_gesture = "none"
+                        self.nav_mode = "search_straight"
+                        self.search_start_time = None
+
+                        if self.current_task == 1:
+                            self.arm_resting()
+                            self.current_task = 0
+                        elif self.current_task == 2:
+                            self.arm_dancing()
+                            self.current_task = 0
+                        elif self.current_task == 3:
+                            self.arm_grabbing()
+                            self.current_task = 4
+                        else:
+                            self.arm_releasing()
+                            self.current_task = 0
 
             else:
                 # Tag not detected -> straight-line search + obstacle avoidance
@@ -480,12 +524,15 @@ class FinalProject(Node):
         if gesture == "0":
             self.target_tag = 3
             self.pending_return_tag = -1
+            self.current_task = 1
         elif gesture == "2":
             self.target_tag = 1
             self.pending_return_tag = -1
+            self.current_task = 2
         elif gesture == "5":
             self.target_tag = 2
             self.pending_return_tag = 1
+            self.current_task = 3
 
         self.next_goal = 1
         # Reset nav_mode when starting a new goal
@@ -550,8 +597,15 @@ class FinalProject(Node):
 
         return out, dbg
 
-    def task1_arm(self):
-        "Arm movement for task 1 (dancing when the user seems happy)"
+    def arm_resting(self):
+        "Arm movement for task 1 (resting in the corner)"
+        joint_msg = ArmJointAngles(joint1=0.025, joint2=-0.420, joint3=0.920, joint4=1.120)
+        self.arm_pub.publish(joint_msg)
+        self.get_logger().info(f'Resting Arm')
+        time.sleep(2)
+
+    def arm_dancing(self):
+        "Arm movement for task 2 (dancing when the user seems happy)"
         count = 0
         self.get_logger().info(f'Start dancing')
 
@@ -598,6 +652,43 @@ class FinalProject(Node):
         self.arm_pub.publish(joint_msg)
         time.sleep(2)
         self.get_logger().info(f'Dancing Complete. Return to initial position')
+
+    def arm_grabbing(self):
+        "Arm movement for task 3 (grabbing the bottle)"
+        # send x and z to IK to calculate joint angles
+        if self.cy_tag <= 150:
+            z = 0.15
+        else:
+            z = 0.02
+        joint1, joint2, joint3, joint4 = self.IK(self.front_dist, z)
+
+        joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
+        self.arm_pub.publish(joint_msg)
+        self.get_logger().info(f'Move towards the object')
+        time.sleep(5)
+
+        gripper_msg = ArmGripperPosition(left_gripper=-0.010, right_gripper=-0.010)
+        self.gripper_pub.publish(gripper_msg)
+        self.get_logger().info('Gripper Closed')
+        time.sleep(2)
+
+    def arm_releasing(self):
+        "Arm movement for task 4 (releasing the bottle)"
+        # Put arm to initial position and open gripper
+        joint_msg = ArmJointAngles(joint1=0.0, joint2=0.0, joint3=0.0, joint4=0.0)
+        self.arm_pub.publish(joint_msg)
+        time.sleep(2)
+        self.get_logger().info(f'Arm Initialized')
+
+        gripper_msg = ArmGripperPosition(left_gripper=0.010, right_gripper=0.010)
+        self.gripper_pub.publish(gripper_msg)
+        time.sleep(2)
+        self.get_logger().info('Gripper Openned')
+
+    def IK(self, x, z):
+        "Function used for calculating joint angles through IK"
+        # TODO
+        pass
 
     def _stop(self):
         """Stop the robot by publishing zero velocity."""
