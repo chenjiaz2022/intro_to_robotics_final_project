@@ -8,6 +8,7 @@ import os
 import time
 from omx_cpp_interface.msg import ArmJointAngles, ArmGripperPosition
 from std_msgs.msg import String
+from ik_solver import OpenManipulatorIK
 
 import cv2
 import cv_bridge
@@ -35,6 +36,7 @@ class FinalProject(Node):
         self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
         self.arm_pub = self.create_publisher(ArmJointAngles, self.arm_topic, 10)
         self.gripper_pub = self.create_publisher(ArmGripperPosition, self.gripper_topic, 10)
+        self.ik_solver = OpenManipulatorIK()
 
         # Wait for publishers to initialize
         time.sleep(3)
@@ -147,6 +149,7 @@ class FinalProject(Node):
         self.left_dist = float(np.min(left_slice))
         self.right_dist = float(np.min(right_slice))
         
+
     def _do_obstacle_avoidance(self, use_initial_straight: bool):
         """
         One step of obstacle avoidance state machine.
@@ -538,6 +541,7 @@ class FinalProject(Node):
         # Reset nav_mode when starting a new goal
         self.nav_mode = "search_straight"
 
+
     def _detect_aruco(self, bgr):
         """
         Detect ArUco markers in the image and return their centers + areas with a debug overlay.
@@ -597,12 +601,14 @@ class FinalProject(Node):
 
         return out, dbg
 
+
     def arm_resting(self):
         "Arm movement for task 1 (resting in the corner)"
         joint_msg = ArmJointAngles(joint1=0.025, joint2=-0.420, joint3=0.920, joint4=1.120)
         self.arm_pub.publish(joint_msg)
         self.get_logger().info(f'Resting Arm')
         time.sleep(2)
+
 
     def arm_dancing(self):
         "Arm movement for task 2 (dancing when the user seems happy)"
@@ -653,6 +659,7 @@ class FinalProject(Node):
         time.sleep(2)
         self.get_logger().info(f'Dancing Complete. Return to initial position')
 
+
     def arm_grabbing(self):
         "Arm movement for task 3 (grabbing the bottle)"
         # send x and z to IK to calculate joint angles
@@ -686,13 +693,31 @@ class FinalProject(Node):
         self.get_logger().info('Gripper Openned')
 
     def IK(self, x, z):
-        "Function used for calculating joint angles through IK"
-        # TODO
-        pass
+        target = [x, 0.0, z]
+
+        if not self.ik_solver.is_reachable(target):
+            self.get_logger().warn(f"Target {target} is not reachable, using neutral pose instead")
+            return 0.0, 0.0, 0.0, 0.0
+
+        # Call the IK solver
+        joints, err = self.ik_solver.inverse_kinematics(target_pos=target)
+
+        if joints is None:
+            self.get_logger().warn(f"IK failed for target {target}, using neutral pose")
+            return 0.0, 0.0, 0.0, 0.0
+
+        self.get_logger().info(
+            f"IK solution for {target}: "
+            f"q1={joints[0]:.3f}, q2={joints[1]:.3f}, "
+            f"q3={joints[2]:.3f}, q4={joints[3]:.3f}, err={err:.4f}"
+        )
+
+        return float(joints[0]), float(joints[1]), float(joints[2]), float(joints[3])
 
     def _stop(self):
         """Stop the robot by publishing zero velocity."""
         self.cmd_pub.publish(Twist())
+
 
 def main(args=None):
     rclpy.init(args=args)
