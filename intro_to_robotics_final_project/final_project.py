@@ -8,6 +8,7 @@ import os
 import time
 from omx_cpp_interface.msg import ArmJointAngles, ArmGripperPosition
 from std_msgs.msg import String
+from .ik_solver import OpenManipulatorIK
 
 import cv2
 import cv_bridge
@@ -35,6 +36,7 @@ class FinalProject(Node):
         self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
         self.arm_pub = self.create_publisher(ArmJointAngles, self.arm_topic, 10)
         self.gripper_pub = self.create_publisher(ArmGripperPosition, self.gripper_topic, 10)
+        self.ik_solver = OpenManipulatorIK()
 
         # Wait for publishers to initialize
         time.sleep(3)
@@ -87,6 +89,8 @@ class FinalProject(Node):
         # For gesture debouncing: require same gesture for 3 seconds
         self.last_gesture_raw = None
         self.last_gesture_time = None
+        self.priority_over_avoidance = False
+        self.start_sequence = False
 
         # 0 means idle, 1 means looking for AR tags and approaching
         self.next_goal = 0
@@ -96,13 +100,23 @@ class FinalProject(Node):
         self.current_task = 0
 
         # Parameter for area-based stopping (fraction of image area)
-        self.min_tag_area_percent = 0.14  # 14% of the image area
+        self.min_tag_area_percent = 0.05  # 5% of the image area
 
-        # Obstacle-avoidance state machine for "no-tag" search
-        self.nav_mode = "search_straight"
-        self.avoid_side = 1  # +1 = left, -1 = right
+        # ----------------- NAVIGATION STATE (SQUARE + AVOID) -----------------
+        # nav_mode:
+        #   "square_forward", "square_spin", "square_turn90"  -> square search path
+        #   "avoid_..."                                       -> rectangular obstacle detour
+        self.nav_mode = "square_forward"
+        self.avoid_side = 1          # +1 = left, -1 = right
         self.avoid_phase_start = 0.0
+
+        # For initial kick-off straight when starting search
         self.search_start_time = None
+
+        # Square-path bookkeeping
+        self.square_side_idx = 0     # 0,1,2,3 → which edge of the square
+        self.square_phase_start = None
+        # ---------------------------------------------------------------------
 
         # Initialize Arm and Gripper to initial position
         joint_msg = ArmJointAngles(joint1=0.0, joint2=0.0, joint3=0.0, joint4=0.0)
@@ -147,192 +161,231 @@ class FinalProject(Node):
         self.left_dist = float(np.min(left_slice))
         self.right_dist = float(np.min(right_slice))
         
+
     def _do_obstacle_avoidance(self, use_initial_straight: bool):
         """
-        One step of obstacle avoidance state machine.
+        One step of the navigation / obstacle-avoidance state machine.
+
+        Search behavior (tag NOT visible):
+        - Follow a SQUARE path:
+            square_forward → square_spin (360°) → square_turn90 (90° to next side)
+        - If an obstacle appears on a side, run the original rectangular avoid_* detour,
+            then resume the SAME side of the square (effectively lengthening that side).
 
         use_initial_straight:
-          - True  -> use the initial straight phase (for 'searching' with no tag).
-          - False -> skip initial straight, immediately avoid (for 'tag visible but blocked').
+        - True  -> drive a short initial straight segment before starting the square
+        - False -> used when tag is visible but blocked; we still use the same
+                    avoid_* logic, but skip the initial search kick-off.
         """
         twist = Twist()
-
-        # Parameters
-        safe_front_dist = 0.55      # "object on that line" threshold
-        forward_speed   = 0.10      # straight-line speed
-        turn_speed      = 0.5       # turning speed
-        phase_turn_time = 3.0       # turn duration for each corner
-        phase_fwd_time  = 4.0       # forward duration for bypass segments
-        initial_straight_time = 1.0
-
         now = time.time()
 
-        # Emergency stop if something is extremely close
-        if self.front_dist < 0.22:
-            twist.linear.x = 0.0
-            twist.angular.z = 0.0
-            self.cmd_pub.publish(twist)
+        # Tunable parameters
+        emergency_stop_dist = 0.22     # hard stop
+        safe_front_dist     = 0.55     # obstacle "in the way" threshold
+
+        forward_speed       = 0.12
+        turn_speed          = 0.6
+
+        # Square search timing (seconds) – tune these on the robot
+        side_time           = 9.0      # base time to drive each edge
+        turn90_time         = 2.7      # approx time for a 90° turn
+        spin360_time        = 4 * turn90_time  # 360° = 4 * 90°
+
+        # Short initial straight kick-off when starting the whole search
+        initial_straight_time = 5.33
+        
+        # 0) Emergency stop if something is extremely close
+        if self.front_dist < emergency_stop_dist:
+            self.cmd_pub.publish(Twist())
             return
 
-        # Optional initial straight-line phase (used only for "search" mode)
-        if use_initial_straight:
+        # 1) An initial ~180° turn, not forward motion <<<
+        if use_initial_straight and not self.nav_mode.startswith("avoid_"):
             if self.search_start_time is None:
                 self.search_start_time = now
-            elapsed_search = now - self.search_start_time
-
-            if elapsed_search < initial_straight_time:
-                # Go straight, minimal safety stop only if REALLY close
-                twist.linear.x = forward_speed
-                twist.angular.z = 0.0
-
-                if self.front_dist < 0.20:
-                    twist.linear.x = 0.0
-
-                self.cmd_pub.publish(twist)
-                return
-
-            # After initial straight finished, one more close-stop check
-            if self.front_dist < 0.22:
+            if now - self.search_start_time < initial_straight_time:
+                # First, always turn in place (~180°) before starting the square path
                 twist.linear.x = 0.0
-                twist.angular.z = 0.0
+                twist.angular.z = turn_speed
                 self.cmd_pub.publish(twist)
                 return
         else:
-            # For tag-visible avoidance, we don't use the straight-search timer
+            # For tag-visible avoidance, we don't use this initial phase
             self.search_start_time = None
 
-        # State machine for rectangle-like avoidance path:
-        # turn → forward → parallel → turn back → forward
-        now = time.time()
+        # 2) If we are currently in a rectangular detour, finish that first
+        if self.nav_mode.startswith("avoid_"):
+            # Original rectangle parameters
+            phase_turn_time = 2.5
+            phase_fwd_time  = 4.0 + 1.0
 
-        if self.nav_mode == "search_straight":
-            if use_initial_straight:
-                # Normal search mode: straight until obstacle
-                if self.front_dist > safe_front_dist:
+            if self.nav_mode == "avoid_turn1":
+                # First corner: rotate away from obstacle
+                if now - self.avoid_phase_start < phase_turn_time:
+                    twist.linear.x = 0.0
+                    twist.angular.z = turn_speed * self.avoid_side
+                else:
+                    self.nav_mode = "avoid_forward1"
+                    self.avoid_phase_start = now
+                    twist.linear.x = forward_speed
+                    twist.angular.z = 0.0
+
+            elif self.nav_mode == "avoid_forward1":
+                # Move in that direction (first forward edge)
+                if now - self.avoid_phase_start < phase_fwd_time:
                     twist.linear.x = forward_speed
                     twist.angular.z = 0.0
                 else:
-                    self.get_logger().info("obstacle")
-                    # Obstacle in front → start rectangle
-                    if self.left_dist > self.right_dist:
-                        self.avoid_side = 1   # turn left
-                    else:
-                        self.avoid_side = -1  # turn right
-
-                    self.nav_mode = "avoid_turn1"
+                    self.nav_mode = "avoid_turn2"
                     self.avoid_phase_start = now
+                    twist.linear.x = 0.0
+                    twist.angular.z = -turn_speed * self.avoid_side
 
+            elif self.nav_mode == "avoid_turn2":
+                # Turn back to be parallel to original line
+                if now - self.avoid_phase_start < phase_turn_time:
+                    twist.linear.x = 0.0
+                    twist.angular.z = -turn_speed * self.avoid_side
+                else:
+                    self.nav_mode = "avoid_forward2"
+                    self.avoid_phase_start = now
+                    twist.linear.x = forward_speed
+                    twist.angular.z = 0.0
+
+            elif self.nav_mode == "avoid_forward2":
+                # Move parallel to the original line (passing the obstacle)
+                if now - self.avoid_phase_start < (phase_fwd_time + 0.5):
+                    twist.linear.x = forward_speed
+                    twist.angular.z = 0.0
+                else:
+                    # Now start coming back toward the original line
+                    self.nav_mode = "avoid_turn3"
+                    self.avoid_phase_start = now
+                    twist.linear.x = 0.0
+                    twist.angular.z = -turn_speed * self.avoid_side
+
+            elif self.nav_mode == "avoid_turn3":
+                # Turn to head back toward the original straight line
+                if now - self.avoid_phase_start < phase_turn_time:
+                    twist.linear.x = 0.0
+                    twist.angular.z = -turn_speed * self.avoid_side
+                else:
+                    self.nav_mode = "avoid_forward3"
+                    self.avoid_phase_start = now
+                    twist.linear.x = forward_speed
+                    twist.angular.z = 0.0
+
+            elif self.nav_mode == "avoid_forward3":
+                # Move sideways back toward the original straight line
+                if now - self.avoid_phase_start < phase_fwd_time:
+                    twist.linear.x = forward_speed
+                    twist.angular.z = 0.0
+                else:
+                    # Final turn to restore original heading
+                    self.nav_mode = "avoid_turn4"
+                    self.avoid_phase_start = now
                     twist.linear.x = 0.0
                     twist.angular.z = turn_speed * self.avoid_side
-            else:
-                # Tag-visible case: we *already* decided obstacle is in front,
-                # so don't go straight; immediately start the turn.
-                if self.left_dist > self.right_dist:
-                    self.avoid_side = 1
+
+            elif self.nav_mode == "avoid_turn4":
+                # Turn back to original orientation, then resume square search
+                if now - self.avoid_phase_start < phase_turn_time:
+                    twist.linear.x = 0.0
+                    twist.angular.z = turn_speed * self.avoid_side
                 else:
-                    self.avoid_side = -1
-                self.nav_mode = "avoid_turn1"
-                self.avoid_phase_start = now
+                    # Finished the rectangle; back to following the SAME square side.
+                    # Reset square side timing so this side effectively becomes longer.
+                    self.nav_mode = "square_forward"
+                    self.square_phase_start = None
+                    twist.linear.x = forward_speed
+                    twist.angular.z = 0.0
 
-                twist.linear.x = 0.0
-                twist.angular.z = turn_speed * self.avoid_side
-
-        elif self.nav_mode == "avoid_turn1":
-            # First corner: rotate away from obstacle
-            if now - self.avoid_phase_start < phase_turn_time:
-                twist.linear.x = 0.0
-                twist.angular.z = turn_speed * self.avoid_side
             else:
-                self.nav_mode = "avoid_forward1"
-                self.avoid_phase_start = now
+                # Fallback: jump back to square search
+                self.nav_mode = "square_forward"
+                self.square_phase_start = None
                 twist.linear.x = forward_speed
                 twist.angular.z = 0.0
 
-        elif self.nav_mode == "avoid_forward1":
-            # Move in that direction (first forward edge)
-            if now - self.avoid_phase_start < phase_fwd_time:
+            self.cmd_pub.publish(twist)
+            return
+
+        if not use_initial_straight:
+            return
+
+        # 3) Not in a detour → run the square search pattern
+
+        # Ensure nav_mode is one of the square states
+        if self.nav_mode not in ("square_forward", "square_spin", "square_turn90"):
+            self.nav_mode = "square_forward"
+            self.square_phase_start = None
+
+        if self.square_phase_start is None:
+            self.square_phase_start = now
+        elapsed = now - self.square_phase_start
+
+        # If we hit an obstacle while on a side, start the rectangular detour
+        if self.front_dist < safe_front_dist and self.nav_mode == "square_forward":
+            if self.left_dist > self.right_dist:
+                self.avoid_side = 1   # turn left
+            else:
+                self.avoid_side = -1  # turn right
+            self.nav_mode = "avoid_turn1"
+            self.avoid_phase_start = now
+            twist.linear.x = 0.0
+            twist.angular.z = turn_speed * self.avoid_side
+            self.cmd_pub.publish(twist)
+            return
+
+        # Square states
+        if self.nav_mode == "square_forward":
+            # Drive along the current edge
+            if elapsed < side_time:
                 twist.linear.x = forward_speed
                 twist.angular.z = 0.0
             else:
-                self.nav_mode = "avoid_turn2"
-                self.avoid_phase_start = now
+                # Reached the "corner" → start 360° spin
+                self.nav_mode = "square_spin"
+                self.square_phase_start = now
                 twist.linear.x = 0.0
-                twist.angular.z = -turn_speed * self.avoid_side
+                twist.angular.z = turn_speed
 
-        elif self.nav_mode == "avoid_turn2":
-            # Turn back to be parallel to original line
-            if now - self.avoid_phase_start < phase_turn_time:
+        elif self.nav_mode == "square_spin":
+            # Full 360° scan in place at the corner.
+            # image_callback is still running and can see the tag while we spin.
+            if elapsed < spin360_time:
                 twist.linear.x = 0.0
-                twist.angular.z = -turn_speed * self.avoid_side
+                twist.angular.z = turn_speed
             else:
-                self.nav_mode = "avoid_forward2"
-                self.avoid_phase_start = now
-                twist.linear.x = forward_speed
-                twist.angular.z = 0.0
-        
-        # elif self.nav_mode == "avoid_forward2":
-        #     # Move forward to re-enter (approximately) the original straight line
-        #     if now - self.avoid_phase_start < phase_fwd_time:
-        #         twist.linear.x = forward_speed
-        #         twist.angular.z = 0.0
-        #     else:
-        #         # Back to straight mode
-        #         self.nav_mode = "search_straight"
-        #         twist.linear.x = forward_speed
-        #         twist.angular.z = 0.0
+                # Done 360°, now rotate extra 90° to face next side
+                self.nav_mode = "square_turn90"
+                self.square_phase_start = now
+                twist.linear.x = 0.0
+                twist.angular.z = turn_speed
 
-        elif self.nav_mode == "avoid_forward2":
-            # Move parallel to the original line (passing the obstacle)
-            if now - self.avoid_phase_start < phase_fwd_time:
-                twist.linear.x = forward_speed
-                twist.angular.z = 0.0
-            else:
-                # Now start coming back toward the original line
-                self.nav_mode = "avoid_turn3"
-                self.avoid_phase_start = now
+        elif self.nav_mode == "square_turn90":
+            # Finish the 90° turn to align with the next edge
+            if elapsed < turn90_time:
                 twist.linear.x = 0.0
-                twist.angular.z = -turn_speed * self.avoid_side
-
-        elif self.nav_mode == "avoid_turn3":
-            # Turn to head back toward the original straight line
-            if now - self.avoid_phase_start < phase_turn_time:
-                twist.linear.x = 0.0
-                twist.angular.z = -turn_speed * self.avoid_side
+                twist.angular.z = turn_speed
             else:
-                self.nav_mode = "avoid_forward3"
-                self.avoid_phase_start = now
-                twist.linear.x = forward_speed
-                twist.angular.z = 0.0
-
-        elif self.nav_mode == "avoid_forward3":
-            # Move sideways back toward the original straight line
-            if now - self.avoid_phase_start < phase_fwd_time:
-                twist.linear.x = forward_speed
-                twist.angular.z = 0.0
-            else:
-                # Final turn to restore original heading
-                self.nav_mode = "avoid_turn4"
-                self.avoid_phase_start = now
-                twist.linear.x = 0.0
-                twist.angular.z = turn_speed * self.avoid_side
-
-        elif self.nav_mode == "avoid_turn4":
-            # Turn back to the original orientation
-            if now - self.avoid_phase_start < phase_turn_time:
-                twist.linear.x = 0.0
-                twist.angular.z = turn_speed * self.avoid_side
-            else:
-                # Finished the rectangle; back to straight mode
-                self.nav_mode = "search_straight"
+                # Advance to next side in the square
+                self.square_side_idx = (self.square_side_idx + 1) % 4
+                self.nav_mode = "square_forward"
+                self.square_phase_start = now
                 twist.linear.x = forward_speed
                 twist.angular.z = 0.0
 
         else:
-            # Fallback
-            self.nav_mode = "search_straight"
+            # Fallback: reset to square_forward
+            self.nav_mode = "square_forward"
+            self.square_phase_start = now
             twist.linear.x = forward_speed
             twist.angular.z = 0.0
 
+        # Optional debug:
+        self.get_logger().info(f"[NAV] mode={self.nav_mode}, side={self.square_side_idx}, front={self.front_dist:.2f}")
         self.cmd_pub.publish(twist)
 
     def image_callback(self, msg: CompressedImage):
@@ -371,8 +424,8 @@ class FinalProject(Node):
             # If target tag detected
             if self.target_tag in tags:
                 # If obstacle is still on the way, first move around it
-                safe_front_dist = 0.45  # same threshold as in avoidance
-                if self.front_dist <= safe_front_dist:
+                safe_front_dist = 0.35  # same threshold as in avoidance
+                if self.front_dist <= safe_front_dist and not self.priority_over_avoidance:
                     # Do avoidance WITHOUT initial straight phase (tag is visible)
                     self._do_obstacle_avoidance(use_initial_straight=False)
                     return
@@ -396,8 +449,6 @@ class FinalProject(Node):
                 lin_x = self.k_lin * 0.30
                 lin_x = float(np.clip(lin_x, 0.0, self.max_lin))
 
-                start_sequence = False
-
                 # Area-based stopping condition
                 total_pixels = float(h * w)
                 min_tag_area = total_pixels * self.min_tag_area_percent
@@ -405,17 +456,17 @@ class FinalProject(Node):
 
                 # Stop when the tag fills enough of the frame
                 if area >= min_tag_area:
-                    lin_x = 0.0
-                    ang_z = 0.0
-                    start_sequence = True
+                    self.priority_over_avoidance = True
                     self.get_logger().info(
                         f"Tag {self.target_tag} reached (area={area:.1f}, "
                         f"{area_percent:.1f}% of image)."
                     )
 
                 # Never drive forward if LiDAR says too close
-                if self.front_dist < 0.25:
+                if self.front_dist < 0.35:
                     lin_x = 0.0
+                    ang_z = 0.0
+                    self.start_sequence = True
 
                 # Publish motion command
                 twist = Twist()
@@ -423,28 +474,34 @@ class FinalProject(Node):
                 twist.angular.z = ang_z
                 self.cmd_pub.publish(twist)
 
-                if start_sequence:
+                if self.start_sequence:
                     if self.pending_return_tag != -1:
                         # e.g., gesture "5": go to tag 2, then back to tag 1
                         self.target_tag = self.pending_return_tag
                         self.pending_return_tag = -1
                         self.next_goal = 1
-                        self.nav_mode = "search_straight"
+                        self.nav_mode = "square_forward"
                         self.search_start_time = None
+                        self.square_phase_start = None
+                        self.square_side_idx = 0
                         self.get_logger().info('Starting return to tag 1 after reaching tag 2.')
 
                         if self.current_task == 1:
                             self.arm_resting()
                             self.current_task = 0
+                            self.start_sequence = False
                         elif self.current_task == 2:
                             self.arm_dancing()
                             self.current_task = 0
+                            self.start_sequence = False
                         elif self.current_task == 3:
                             self.arm_grabbing()
                             self.current_task = 4
+                            self.start_sequence = False
                         else:
                             self.arm_releasing()
                             self.current_task = 0
+                            self.start_sequence = False
                     
                     else:
                         # Done with this goal
@@ -452,21 +509,27 @@ class FinalProject(Node):
                         self.target_tag = -1
                         self.pending_return_tag = -1
                         self.current_gesture = "none"
-                        self.nav_mode = "search_straight"
+                        self.nav_mode = "square_forward"
                         self.search_start_time = None
+                        self.square_phase_start = None
+                        self.square_side_idx = 0
 
                         if self.current_task == 1:
                             self.arm_resting()
                             self.current_task = 0
+                            self.start_sequence = False
                         elif self.current_task == 2:
                             self.arm_dancing()
                             self.current_task = 0
+                            self.start_sequence = False
                         elif self.current_task == 3:
                             self.arm_grabbing()
                             self.current_task = 4
+                            self.start_sequence = False
                         else:
                             self.arm_releasing()
                             self.current_task = 0
+                            self.start_sequence = False
 
             else:
                 # Tag not detected -> straight-line search + obstacle avoidance
@@ -536,7 +599,10 @@ class FinalProject(Node):
 
         self.next_goal = 1
         # Reset nav_mode when starting a new goal
-        self.nav_mode = "search_straight"
+        self.nav_mode = "square_forward"
+        self.search_start_time = None
+        self.square_phase_start = None
+        self.square_side_idx = 0
 
     def _detect_aruco(self, bgr):
         """
@@ -597,6 +663,7 @@ class FinalProject(Node):
 
         return out, dbg
 
+
     def arm_resting(self):
         "Arm movement for task 1 (resting in the corner)"
         joint_msg = ArmJointAngles(joint1=0.025, joint2=-0.420, joint3=0.920, joint4=1.120)
@@ -604,63 +671,75 @@ class FinalProject(Node):
         self.get_logger().info(f'Resting Arm')
         time.sleep(2)
 
+
     def arm_dancing(self):
         "Arm movement for task 2 (dancing when the user seems happy)"
         count = 0
         self.get_logger().info(f'Start dancing')
 
-        joint_msg = ArmJointAngles(joint1=0.0, joint2=-0.9, joint3=0.0, joint4=0.0)
+        joint1, joint2, joint3, joint4 = self.IK(0.08, 0.00, 0.37)
+        joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
         self.arm_pub.publish(joint_msg)
         time.sleep(2)
 
-        joint_msg = ArmJointAngles(joint1=0.0, joint2=-0.9, joint3=0.0, joint4=0.8)
+        joint1, joint2, joint3, joint4 = self.IK(0.13, 0.00, 0.28)
+        joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
         self.arm_pub.publish(joint_msg)
         time.sleep(2)
 
-        joint_msg = ArmJointAngles(joint1=0.0, joint2=-0.9, joint3=0.0, joint4=0.0)
+        joint1, joint2, joint3, joint4 = self.IK(0.08, 0.00, 0.37)
+        joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
         self.arm_pub.publish(joint_msg)
         time.sleep(2)
 
         while count < 2:
-            joint_msg = ArmJointAngles(joint1=-0.8, joint2=-0.9, joint3=0.0, joint4=0.0)
+            joint1, joint2, joint3, joint4 = self.IK(0.06, -0.06, 0.37)
+            joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
             self.arm_pub.publish(joint_msg)
             time.sleep(4)
 
-            joint_msg = ArmJointAngles(joint1=-0.8, joint2=-0.9, joint3=0.0, joint4=0.8)
+            joint1, joint2, joint3, joint4 = self.IK(0.09, -0.09, 0.28)
+            joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
             self.arm_pub.publish(joint_msg)
             time.sleep(2)
 
-            joint_msg = ArmJointAngles(joint1=-0.8, joint2=-0.9, joint3=0.0, joint4=0.0)
+            joint1, joint2, joint3, joint4 = self.IK(0.06, -0.06, 0.37)
+            joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
             self.arm_pub.publish(joint_msg)
             time.sleep(2)
 
-            joint_msg = ArmJointAngles(joint1=0.8, joint2=-0.9, joint3=0.0, joint4=0.0)
+            joint1, joint2, joint3, joint4 = self.IK(0.06, 0.06, 0.37)
+            joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
             self.arm_pub.publish(joint_msg)
             time.sleep(4)
 
-            joint_msg = ArmJointAngles(joint1=0.8, joint2=-0.9, joint3=0.0, joint4=0.8)
+            joint1, joint2, joint3, joint4 = self.IK(0.09, 0.09, 0.28)
+            joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
             self.arm_pub.publish(joint_msg)
             time.sleep(2)
 
-            joint_msg = ArmJointAngles(joint1=0.8, joint2=-0.9, joint3=0.0, joint4=0.0)
+            joint1, joint2, joint3, joint4 = self.IK(0.06, 0.06, 0.37)
+            joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
             self.arm_pub.publish(joint_msg)
             time.sleep(2)
 
             count += 1
 
-        joint_msg = ArmJointAngles(joint1=0.0, joint2=0.0, joint3=0.0, joint4=0.0)
+        joint1, joint2, joint3, joint4 = self.IK(0.29, 0.00, 0.21)
+        joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
         self.arm_pub.publish(joint_msg)
         time.sleep(2)
         self.get_logger().info(f'Dancing Complete. Return to initial position')
 
+
     def arm_grabbing(self):
         "Arm movement for task 3 (grabbing the bottle)"
         # send x and z to IK to calculate joint angles
-        if self.cy_tag <= 150:
-            z = 0.15
+        if self.cy_tag <= 120:
+            z = 0.20
         else:
             z = 0.02
-        joint1, joint2, joint3, joint4 = self.IK(self.front_dist, z)
+        joint1, joint2, joint3, joint4 = self.IK(self.front_dist, 0.0, z)
 
         joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
         self.arm_pub.publish(joint_msg)
@@ -685,14 +764,32 @@ class FinalProject(Node):
         time.sleep(2)
         self.get_logger().info('Gripper Openned')
 
-    def IK(self, x, z):
-        "Function used for calculating joint angles through IK"
-        # TODO
-        pass
+    def IK(self, x, y, z):
+        target = [x, y, z]
+
+        if not self.ik_solver.is_reachable(target):
+            self.get_logger().warn(f"Target {target} is not reachable, using neutral pose instead")
+            return 0.0, 0.0, 0.0, 0.0
+
+        # Call the IK solver
+        joints, err = self.ik_solver.inverse_kinematics(target_pos=target)
+
+        if joints is None:
+            self.get_logger().warn(f"IK failed for target {target}, using neutral pose")
+            return 0.0, 0.0, 0.0, 0.0
+
+        self.get_logger().info(
+            f"IK solution for {target}: "
+            f"q1={joints[0]:.3f}, q2={joints[1]:.3f}, "
+            f"q3={joints[2]:.3f}, q4={joints[3]:.3f}, err={err:.4f}"
+        )
+
+        return float(joints[0]), float(joints[1]), float(joints[2]), float(joints[3])
 
     def _stop(self):
         """Stop the robot by publishing zero velocity."""
         self.cmd_pub.publish(Twist())
+
 
 def main(args=None):
     rclpy.init(args=args)
