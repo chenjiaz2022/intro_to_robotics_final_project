@@ -746,7 +746,7 @@ class FinalProject(Node):
         self.get_logger().info(f'Move towards the object')
         time.sleep(5)
 
-        gripper_msg = ArmGripperPosition(left_gripper=-0.010, right_gripper=-0.010)
+        gripper_msg = ArmGripperPosition(left_gripper=-0.0035, right_gripper=-0.0035)
         self.gripper_pub.publish(gripper_msg)
         self.get_logger().info('Gripper Closed')
         time.sleep(2)
