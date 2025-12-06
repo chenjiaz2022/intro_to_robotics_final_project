@@ -30,16 +30,19 @@ hands = mp_hands.Hands(
 )
 
 def landmarks_to_feature(hand_landmarks):
+    """Convert raw MediaPipe landmark data to a normalized 63-dim vector."""
     lm = hand_landmarks.landmark
     xs = np.array([p.x for p in lm])
     ys = np.array([p.y for p in lm])
     zs = np.array([p.z for p in lm])
 
+    # Center landmarks around wrist
     x0, y0, z0 = xs[0], ys[0], zs[0]
     xs = xs - x0
     ys = ys - y0
     zs = zs - z0
 
+    # Normalize by maximum spread of points
     norms = np.sqrt(xs**2 + ys**2 + zs**2)
     max_norm = np.max(norms)
     if max_norm > 0:
@@ -51,6 +54,7 @@ def landmarks_to_feature(hand_landmarks):
     return feature.astype(np.float32)
 
 def predict_gesture(feature, k=5):
+    """Perform K-nearest-neighbors classification on the hand feature vector."""
     if not model_trained or X_train is None or y_train is None:
         return "none"
 
@@ -60,12 +64,15 @@ def predict_gesture(feature, k=5):
 
     k = min(k, n_samples)
 
+    # Compute Euclidean distances to all training samples
     diffs = X_train - feature
     dists = np.linalg.norm(diffs, axis=1)
 
+    # Choose nearest neighbors
     knn_idx = np.argsort(dists)[:k]
     knn_labels = y_train[knn_idx]
 
+    # Return most frequent label
     values, counts = np.unique(knn_labels, return_counts=True)
     majority_label = values[np.argmax(counts)]
     return str(int(majority_label))
@@ -104,6 +111,7 @@ class GestureRecognizer(Node):
         )
 
     def image_callback(self, msg: Image):
+        """Process camera frames and publish gesture predictions."""
         # Convert ROS image to OpenCV BGR frame
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
@@ -112,6 +120,7 @@ class GestureRecognizer(Node):
 
         movements = {'left': "none", 'right': "none"}
 
+        # If one or more hands detected, classify each hand
         if hands_detected.multi_hand_landmarks:
             for hand_landmarks, hand_class in zip(
                 hands_detected.multi_hand_landmarks,
@@ -127,11 +136,12 @@ class GestureRecognizer(Node):
                     drawing_styles.get_default_hand_connections_style(),
                 )
 
+                # Convert to feature and classify
                 feat = landmarks_to_feature(hand_landmarks)
                 gesture = predict_gesture(feat)
                 movements[hand_label] = gesture
 
-        # Decide what to send
+        # Choose one gesture to broadcast
         detected_gestures = [g for g in movements.values() if g != "none"]
         if detected_gestures:
             gesture_message = detected_gestures[0]
@@ -143,7 +153,7 @@ class GestureRecognizer(Node):
         msg_out.data = gesture_message
         self.gesture_pub.publish(msg_out)
 
-        # Send via OSC if some other system needs it
+        # Send via OSC
         client.send_message("/hand_movement", gesture_message)
 
         debug_message = f"left hand {movements['left']}, right hand {movements['right']}"
@@ -152,6 +162,7 @@ class GestureRecognizer(Node):
         cv.imshow("Real-time Gesture", frame)
         print(debug_message, "-> sent:", gesture_message)
 
+        # Quit window
         key = cv.waitKey(5) & 0xFF
         if key == ord('q'):
             self.get_logger().info("Exiting gesture recognizer.")

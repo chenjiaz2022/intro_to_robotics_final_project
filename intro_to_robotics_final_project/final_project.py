@@ -45,32 +45,33 @@ class FinalProject(Node):
         self.bridge = cv_bridge.CvBridge()
         cv2.namedWindow("window", 1)
 
-        # Set up subscribers. topic first, then callback
+        # Set up LiDAR subscriber for obstacle information
         self.scan_topic = f'/tb{ros_domain_id}/scan'
         self.laser_sub = self.create_subscription(
             LaserScan, self.scan_topic, self.scan_callback, 10
         )
 
+        # Subscribe to compressed RGB image
         self.image_topic = f'/tb{ros_domain_id}/oakd/rgb/preview/image_raw/compressed'
         self.image_sub = self.create_subscription(
             CompressedImage, self.image_topic, self.image_callback, 10
         )
 
-        # Gesture subscriber (from gesture.py)
+        # Subscribe to recognized hand gesture messages
         self.gesture_topic = f'/tb{ros_domain_id}/hand_movement'
         self.gesture_sub = self.create_subscription(
             String, self.gesture_topic, self.gesture_callback, 10
         )
         self.get_logger().info(f'Subscribed to gesture topic {self.gesture_topic}')
 
-        # Useful attributes
+        # Initialize distance estimates
         self.front_dist = 10.0
         self.left_dist = 10.0
         self.right_dist = 10.0
         self.next_task = None
         self.cy_tag = 0
 
-        # Controller params for AR tag approach
+        # Controller gains and limits for AR-tag approach
         self.k_ang = 0.0025
         self.k_lin = 0.22
         self.max_ang = 1.5
@@ -100,23 +101,19 @@ class FinalProject(Node):
         self.current_task = 0
 
         # Parameter for area-based stopping (fraction of image area)
-        self.min_tag_area_percent = 0.05  # 5% of the image area
+        self.min_tag_area_percent = 0.05 # 5% of the image area
 
-        # ----------------- NAVIGATION STATE (SQUARE + AVOID) -----------------
-        # nav_mode:
-        #   "square_forward", "square_spin", "square_turn90"  -> square search path
-        #   "avoid_..."                                       -> rectangular obstacle detour
+        # Navigation state (square path + obstacle avoidance)
         self.nav_mode = "square_forward"
-        self.avoid_side = 1          # +1 = left, -1 = right
+        self.avoid_side = 1 # +1 = left, -1 = right
         self.avoid_phase_start = 0.0
 
         # For initial kick-off straight when starting search
         self.search_start_time = None
 
         # Square-path bookkeeping
-        self.square_side_idx = 0     # 0,1,2,3 → which edge of the square
+        self.square_side_idx = 0
         self.square_phase_start = None
-        # ---------------------------------------------------------------------
 
         # Initialize Arm and Gripper to initial position
         joint_msg = ArmJointAngles(joint1=0.0, joint2=0.0, joint3=0.0, joint4=0.0)
@@ -144,6 +141,7 @@ class FinalProject(Node):
 
         # Helper to clamp indices
         def clamp_slice(start, end):
+            """Return valid slice of ranges or a dummy huge distance array."""
             start = max(0, start)
             end = min(n, end)
             if start >= end:
@@ -158,9 +156,9 @@ class FinalProject(Node):
         left_slice = clamp_slice(mid + 20, mid + 60)
         right_slice = clamp_slice(mid - 60, mid - 20)
 
+        # Track minimum distances in each sector
         self.left_dist = float(np.min(left_slice))
-        self.right_dist = float(np.min(right_slice))
-        
+        self.right_dist = float(np.min(right_slice))     
 
     def _do_obstacle_avoidance(self, use_initial_straight: bool):
         """
@@ -173,9 +171,8 @@ class FinalProject(Node):
             then resume the SAME side of the square (effectively lengthening that side).
 
         use_initial_straight:
-        - True  -> drive a short initial straight segment before starting the square
-        - False -> used when tag is visible but blocked; we still use the same
-                    avoid_* logic, but skip the initial search kick-off.
+        - True  -> special initial rotation before square pattern
+        - False -> use only avoidance logic, no initial search behavior.
         """
         twist = Twist()
         now = time.time()
@@ -187,12 +184,12 @@ class FinalProject(Node):
         forward_speed       = 0.12
         turn_speed          = 0.6
 
-        # Square search timing (seconds) – tune these on the robot
+        # Square search timing (seconds)
         side_time           = 9.0      # base time to drive each edge
         turn90_time         = 2.7      # approx time for a 90° turn
         spin360_time        = 4 * turn90_time  # 360° = 4 * 90°
 
-        # Short initial straight kick-off when starting the whole search
+        # Duration of initial "turn in place" behavior
         initial_straight_time = 5.33
         
         # 0) Emergency stop if something is extremely close
@@ -200,84 +197,88 @@ class FinalProject(Node):
             self.cmd_pub.publish(Twist())
             return
 
-        # 1) An initial ~180° turn, not forward motion <<<
+        # 1) Optional initial turning phase before starting square pattern
         if use_initial_straight and not self.nav_mode.startswith("avoid_"):
             if self.search_start_time is None:
                 self.search_start_time = now
             if now - self.search_start_time < initial_straight_time:
-                # First, always turn in place (~180°) before starting the square path
+                # Turn in place to scan the environment
                 twist.linear.x = 0.0
                 twist.angular.z = turn_speed
                 self.cmd_pub.publish(twist)
                 return
         else:
-            # For tag-visible avoidance, we don't use this initial phase
+            # If not using initial phase, clear search_start_time
             self.search_start_time = None
 
-        # 2) If we are currently in a rectangular detour, finish that first
+        # 2) If currently in rectangular avoidance sequence, handle those states
         if self.nav_mode.startswith("avoid_"):
-            # Original rectangle parameters
+            # Duration for each rectangular detour phase
             phase_turn_time = 2.5
             phase_fwd_time  = 4.0 + 1.0
 
+            # First avoidance turn: rotate away from obstacle
             if self.nav_mode == "avoid_turn1":
-                # First corner: rotate away from obstacle
                 if now - self.avoid_phase_start < phase_turn_time:
                     twist.linear.x = 0.0
                     twist.angular.z = turn_speed * self.avoid_side
                 else:
+                    # Move to forward phase after first turn
                     self.nav_mode = "avoid_forward1"
                     self.avoid_phase_start = now
                     twist.linear.x = forward_speed
                     twist.angular.z = 0.0
 
+            # Move away from obstacle in new direction
             elif self.nav_mode == "avoid_forward1":
-                # Move in that direction (first forward edge)
                 if now - self.avoid_phase_start < phase_fwd_time:
                     twist.linear.x = forward_speed
                     twist.angular.z = 0.0
                 else:
+                    # Begin second turn to align parallel to original direction
                     self.nav_mode = "avoid_turn2"
                     self.avoid_phase_start = now
                     twist.linear.x = 0.0
                     twist.angular.z = -turn_speed * self.avoid_side
 
+            # Turn to be parallel to original heading
             elif self.nav_mode == "avoid_turn2":
-                # Turn back to be parallel to original line
                 if now - self.avoid_phase_start < phase_turn_time:
                     twist.linear.x = 0.0
                     twist.angular.z = -turn_speed * self.avoid_side
                 else:
+                    # Move parallel to the original line
                     self.nav_mode = "avoid_forward2"
                     self.avoid_phase_start = now
                     twist.linear.x = forward_speed
                     twist.angular.z = 0.0
 
+            # Move parallel to the original path, passing around obstacle
             elif self.nav_mode == "avoid_forward2":
-                # Move parallel to the original line (passing the obstacle)
                 if now - self.avoid_phase_start < (phase_fwd_time + 0.5):
                     twist.linear.x = forward_speed
                     twist.angular.z = 0.0
                 else:
-                    # Now start coming back toward the original line
+                    # Begin turning back toward original line
                     self.nav_mode = "avoid_turn3"
                     self.avoid_phase_start = now
                     twist.linear.x = 0.0
                     twist.angular.z = -turn_speed * self.avoid_side
 
+            # Turn to head toward the original path again
             elif self.nav_mode == "avoid_turn3":
-                # Turn to head back toward the original straight line
                 if now - self.avoid_phase_start < phase_turn_time:
                     twist.linear.x = 0.0
                     twist.angular.z = -turn_speed * self.avoid_side
                 else:
+                    # Move sideways back toward original path
                     self.nav_mode = "avoid_forward3"
                     self.avoid_phase_start = now
                     twist.linear.x = forward_speed
                     twist.angular.z = 0.0
 
+            # Move back across to rejoin original line
             elif self.nav_mode == "avoid_forward3":
-                # Move sideways back toward the original straight line
                 if now - self.avoid_phase_start < phase_fwd_time:
                     twist.linear.x = forward_speed
                     twist.angular.z = 0.0
@@ -288,21 +289,20 @@ class FinalProject(Node):
                     twist.linear.x = 0.0
                     twist.angular.z = turn_speed * self.avoid_side
 
+            # Final turn in the rectangle, then resume square pattern
             elif self.nav_mode == "avoid_turn4":
-                # Turn back to original orientation, then resume square search
                 if now - self.avoid_phase_start < phase_turn_time:
                     twist.linear.x = 0.0
                     twist.angular.z = turn_speed * self.avoid_side
                 else:
-                    # Finished the rectangle; back to following the SAME square side.
-                    # Reset square side timing so this side effectively becomes longer.
+                    # Return to square search on the same side
                     self.nav_mode = "square_forward"
                     self.square_phase_start = None
                     twist.linear.x = forward_speed
                     twist.angular.z = 0.0
 
             else:
-                # Fallback: jump back to square search
+                # If unexpected nav_mode, reset to square search pattern
                 self.nav_mode = "square_forward"
                 self.square_phase_start = None
                 twist.linear.x = forward_speed
@@ -311,10 +311,11 @@ class FinalProject(Node):
             self.cmd_pub.publish(twist)
             return
 
+        # If we are here and not using initial straight, do nothing more
         if not use_initial_straight:
             return
 
-        # 3) Not in a detour → run the square search pattern
+        # 3) Not in a detour -> run the square search pattern
 
         # Ensure nav_mode is one of the square states
         if self.nav_mode not in ("square_forward", "square_spin", "square_turn90"):
@@ -327,6 +328,7 @@ class FinalProject(Node):
 
         # If we hit an obstacle while on a side, start the rectangular detour
         if self.front_dist < safe_front_dist and self.nav_mode == "square_forward":
+            # Turn toward side with more free space
             if self.left_dist > self.right_dist:
                 self.avoid_side = 1   # turn left
             else:
@@ -345,7 +347,7 @@ class FinalProject(Node):
                 twist.linear.x = forward_speed
                 twist.angular.z = 0.0
             else:
-                # Reached the "corner" → start 360° spin
+                # Reached the "corner" -> start 360° spin
                 self.nav_mode = "square_spin"
                 self.square_phase_start = now
                 twist.linear.x = 0.0
@@ -384,7 +386,6 @@ class FinalProject(Node):
             twist.linear.x = forward_speed
             twist.angular.z = 0.0
 
-        # Optional debug:
         self.get_logger().info(f"[NAV] mode={self.nav_mode}, side={self.square_side_idx}, front={self.front_dist:.2f}")
         self.cmd_pub.publish(twist)
 
@@ -394,8 +395,7 @@ class FinalProject(Node):
         Stopping condition is based on the proportion of the image occupied by the tag.
 
         When tag is not visible but we have a navigation goal, we do:
-          - Straight-line search forward
-          - Obstacle avoidance only for obstacles directly in front
+          - Search behavior + obstacle avoidance routine.
         """
         image = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
@@ -424,9 +424,9 @@ class FinalProject(Node):
             # If target tag detected
             if self.target_tag in tags:
                 # If obstacle is still on the way, first move around it
-                safe_front_dist = 0.35  # same threshold as in avoidance
+                safe_front_dist = 0.35
                 if self.front_dist <= safe_front_dist and not self.priority_over_avoidance:
-                    # Do avoidance WITHOUT initial straight phase (tag is visible)
+                    # Avoidance-only movement, tag is visible but obstructed
                     self._do_obstacle_avoidance(use_initial_straight=False)
                     return
 
@@ -480,6 +480,7 @@ class FinalProject(Node):
                 twist.angular.z = ang_z
                 self.cmd_pub.publish(twist)
 
+                # Once we decide to start sequence (reached goal), handle tasks
                 if self.start_sequence:
                     if self.pending_return_tag != -1:
                         # e.g., gesture "5": go to tag 2, then back to tag 1
@@ -492,6 +493,7 @@ class FinalProject(Node):
                         self.square_side_idx = 0
                         self.get_logger().info('Starting return to tag 1 after reaching tag 2.')
 
+                        # Execute correct task based on current_task state
                         if self.current_task == 1:
                             self.arm_resting()
                             self.current_task = 0
@@ -510,7 +512,7 @@ class FinalProject(Node):
                             self.start_sequence = False
                     
                     else:
-                        # Done with this goal
+                        # No return tag queued -> fully complete this goal and reset
                         self.next_goal = 0
                         self.target_tag = -1
                         self.pending_return_tag = -1
@@ -520,6 +522,7 @@ class FinalProject(Node):
                         self.square_phase_start = None
                         self.square_side_idx = 0
 
+                        # Execute the task corresponding to this goal
                         if self.current_task == 1:
                             self.arm_resting()
                             self.current_task = 0
@@ -546,9 +549,9 @@ class FinalProject(Node):
         Receive gesture from Gesture.py and set the AR tag goal.
 
         Mapping:
-          gesture "0" -> move to AR tag 3
-          gesture "2" -> move to AR tag 1
-          gesture "5" -> move to AR tag 2, then back to AR tag 1
+          gesture "0" -> move to AR tag 3 (resting corner)
+          gesture "2" -> move to AR tag 1 (dancing with user)
+          gesture "5" -> move to AR tag 2, then back to AR tag 1 (grab and return)
         """
         # If currently executing a navigation goal, ignore new gestures
         if self.next_goal == 1:
@@ -573,13 +576,11 @@ class FinalProject(Node):
 
         # Check how long it's been stable
         if self.last_gesture_time is None:
-            # Shouldn't really happen, but be safe
             self.last_gesture_time = now
             return
 
         elapsed = now - self.last_gesture_time
         if elapsed < 3.0:
-            # Need at least 3 seconds of the same gesture
             return
 
         # At this point, the same valid gesture has been observed for >= 3 seconds
@@ -590,6 +591,7 @@ class FinalProject(Node):
         self.current_gesture = gesture
         self.get_logger().info(f"Recognized gesture {gesture} (stable for {elapsed:.1f} s)")
 
+        # Map gestures to AR tags and tasks
         if gesture == "0":
             self.target_tag = 3
             self.pending_return_tag = -1
@@ -651,15 +653,18 @@ class FinalProject(Node):
             return corners, ids, dict_name
 
         corners, ids, used_dict = detect_with_dict(self.aruco_dict)
+        # Draw detected markers on debug image if any are found
         if corners is not None:
             cv2.aruco.drawDetectedMarkers(dbg, corners, ids)
         else:
             return out, dbg
 
+        # If ids is None or empty, no markers are present
         if ids is None or len(ids) == 0:
             return out, dbg
 
         ids = ids.flatten()
+        # Loop over all detected markers and compute centers and areas
         for i, tid in enumerate(ids):
             pts = corners[i][0] if len(corners[i].shape) == 3 else corners[i]
             cx = int(np.mean(pts[:, 0]))
@@ -669,12 +674,12 @@ class FinalProject(Node):
                 # Store center and area
                 out[int(tid)] = ((cx, cy), area)
 
+            # Visualize center and tag ID on debug image
             cv2.circle(dbg, (cx, cy), 5, (0, 255, 0), -1)
             cv2.putText(dbg, f"id:{tid}", (cx + 6, cy - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         return out, dbg
-
 
     def arm_resting(self):
         "Arm movement for task 1 (resting in the corner)"
@@ -682,7 +687,6 @@ class FinalProject(Node):
         self.arm_pub.publish(joint_msg)
         self.get_logger().info(f'Resting Arm')
         time.sleep(2)
-
 
     def arm_dancing(self):
         "Arm movement for task 2 (dancing when the user seems happy)"
@@ -704,6 +708,7 @@ class FinalProject(Node):
         self.arm_pub.publish(joint_msg)
         time.sleep(2)
 
+        # Repeat left/right waving motions a couple of times
         while count < 2:
             joint1, joint2, joint3, joint4 = self.IK(0.06, -0.06, 0.37)
             joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
@@ -737,12 +742,12 @@ class FinalProject(Node):
 
             count += 1
 
+        # Return arm to an initial/neutral pose when done
         joint1, joint2, joint3, joint4 = self.IK(0.29, 0.00, 0.21)
         joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
         self.arm_pub.publish(joint_msg)
         time.sleep(2)
         self.get_logger().info(f'Dancing Complete. Return to initial position')
-
 
     def arm_grabbing(self):
         "Arm movement for task 3 (grabbing the bottle)"
@@ -753,11 +758,13 @@ class FinalProject(Node):
             z = 0.02
         joint1, joint2, joint3, joint4 = self.IK(self.front_dist, 0.0, z)
 
+        # Move arm toward computed pose
         joint_msg = ArmJointAngles(joint1=joint1, joint2=joint2, joint3=joint3, joint4=joint4)
         self.arm_pub.publish(joint_msg)
         self.get_logger().info(f'Move towards the object')
         time.sleep(5)
 
+        # Close gripper to grab the bottle
         gripper_msg = ArmGripperPosition(left_gripper=-0.0035, right_gripper=-0.0035)
         self.gripper_pub.publish(gripper_msg)
         self.get_logger().info('Gripper Closed')
@@ -770,13 +777,14 @@ class FinalProject(Node):
         self.arm_pub.publish(joint_msg)
         time.sleep(2)
         self.get_logger().info(f'Arm Initialized')
-
+        
         gripper_msg = ArmGripperPosition(left_gripper=0.010, right_gripper=0.010)
         self.gripper_pub.publish(gripper_msg)
         time.sleep(2)
         self.get_logger().info('Gripper Openned')
 
     def IK(self, x, y, z):
+        """Wrapper around IK solver that returns joint angles for (x, y, z) target."""
         target = [x, y, z]
 
         if not self.ik_solver.is_reachable(target):
@@ -801,7 +809,6 @@ class FinalProject(Node):
     def _stop(self):
         """Stop the robot by publishing zero velocity."""
         self.cmd_pub.publish(Twist())
-
 
 def main(args=None):
     rclpy.init(args=args)

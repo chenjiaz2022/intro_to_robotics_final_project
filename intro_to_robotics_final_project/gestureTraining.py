@@ -80,23 +80,29 @@ class GestureDatasetCollector(Node):
         )
 
     def image_callback(self, msg: Image):
+        """Process each incoming camera frame, detect hands, and record samples."""
         global current_features, training_data, training_labels
 
+        # Convert ROS2 image to OpenCV BGR
         frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
+        # Convert to RGB for MediaPipe
         frame_rgb = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
         hands_detected = hands.process(frame_rgb)
 
+        # Reset current frame’s feature vectors
         current_features["left"] = None
         current_features["right"] = None
 
+        # Loop through detected hands and extract features
         if hands_detected.multi_hand_landmarks:
             for hand_landmarks, hand_class in zip(
                 hands_detected.multi_hand_landmarks,
                 hands_detected.multi_handedness
             ):
-                hand_label = hand_class.classification[0].label.lower()  # 'left' or 'right'
+                hand_label = hand_class.classification[0].label.lower() # 'left' or 'right'
 
+                # Draw skeleton on visualization frame
                 drawing.draw_landmarks(
                     frame,
                     hand_landmarks,
@@ -104,23 +110,28 @@ class GestureDatasetCollector(Node):
                     drawing_styles.get_default_hand_landmarks_style(),
                     drawing_styles.get_default_hand_connections_style(),
                 )
-
+                
+                # Convert landmarks to feature vector
                 feat = landmarks_to_feature(hand_landmarks)
                 current_features[hand_label] = feat
 
+        # Display UI instructions
         cv.putText(frame, "Press 0/2/5 to add sample, 's' to save, 'q' to quit.",
                    (10, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         cv.imshow("Dataset Collector", frame)
 
+        # Handle key presses
         key = cv.waitKey(20) & 0xFF
         if key == ord('q'):
             self.get_logger().info("Quitting dataset collection.")
             rclpy.shutdown()
             return
 
+        # If recording a gesture
         if key in [ord('0'), ord('2'), ord('5')]:
             label = int(chr(key))
             saved_any = False
+             # Save features from any detected hand
             for side in ["left", "right"]:
                 feat = current_features[side]
                 if feat is not None:
@@ -132,6 +143,7 @@ class GestureDatasetCollector(Node):
             else:
                 print("No hand detected when you pressed the key, nothing saved.")
 
+        # Save dataset to disk
         if key == ord('s'):
             if len(training_labels) == 0:
                 print("No samples to save yet.")
