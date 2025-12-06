@@ -50,7 +50,10 @@ Provides an inverse kinematics solver for the OpenMANIPULATOR arm.
 ![ROS Node Diagram](./ros2_node_diagram.png)
 
 ## Execution
-
+[Terminal #1] SSH into the robot (password: turtlebot4), check USB port number, and run bringup:
+`$ set_robot_num [robot_num]
+$ ssh ubuntu@$ROBOT_IP
+$ sudo dmesg | grep ttyUSB`
 
 ## Challenges
 
