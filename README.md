@@ -50,35 +50,54 @@ Provides an inverse kinematics solver for the OpenMANIPULATOR arm.
 ![ROS Node Diagram](./ros2_node_diagram.png)
 
 ## Execution
-  * **[Terminal #1]** SSH into the robot (password: turtlebot4), check USB port number, and run bringup:
 
-`$ set_robot_num [robot_num]
+### **[Terminal #1]** SSH into the robot, check USB port, and run bringup
 
-$ ssh ubuntu@$ROBOT_IP
+Set the robot number:
 
-$ sudo dmesg | grep ttyUSB`
+```bash
+set_robot_num [robot_num]
+```
+```bash
+ssh ubuntu@$ROBOT_IP
+```
+```bash
+sudo dmesg | grep ttyUSB`
+```
 
 After running sudo dmesg | grep ttyUSB look for which USB port the FTDI USB Serial Device is connected to, it should be either ttyUSB0 or ttyUSB1. Now run the bringup command for the arm by specifying the USB port you identified in the prior step.
 
-`$ bringup_arm port_name:=/dev/ttyUSB1`
+```bash
+bringup_arm port_name:=/dev/ttyUSB1
+```
 
  * **[Terminal #2]** SSH into the robot and start MoveIt!: In a separate second terminal, ssh into the robot and start MoveIt!.
 
-`$ ssh ubuntu@$ROBOT_IP
+```bash
+ssh ubuntu@$ROBOT_IP
+```
 
-$ start_moveit`
+```bash
+start_moveit
+```
 
  * **[Terminal #3]** Run the OpenManipulator c++ interface on the PC.
 
-`ros2 run omx_cpp_interface arm_cmd`
+```bash
+ros2 run omx_cpp_interface arm_cmd
+```
 
  * **[Terminal #4]** Run the gesture node, which will send the continuous detected gesture signals to your Turtlebot.
 
-`ros2 run intro_to_robotics_final_project gesture`
+```bash
+ros2 run intro_to_robotics_final_project gesture
+```
 
  * **[Terminal #5]** Run the main node.
 
-`ros2 run intro_to_robotics_final_project final-project`
+```bash
+ros2 run intro_to_robotics_final_project final-project
+```
 
 
 ## Challenges
