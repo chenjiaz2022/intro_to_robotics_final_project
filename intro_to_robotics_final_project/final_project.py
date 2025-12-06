@@ -122,7 +122,7 @@ class FinalProject(Node):
         joint_msg = ArmJointAngles(joint1=0.0, joint2=0.0, joint3=0.0, joint4=0.0)
         self.arm_pub.publish(joint_msg)
         time.sleep(2)
-        self.get_logger().info(f'Arm Initialized')
+        self.get_logger().info('Arm Initialized')
 
         gripper_msg = ArmGripperPosition(left_gripper=0.010, right_gripper=0.010)
         self.gripper_pub.publish(gripper_msg)
@@ -463,7 +463,13 @@ class FinalProject(Node):
                     )
 
                 # Never drive forward if LiDAR says too close
-                if self.front_dist < 0.35:
+                if self.target_tag == 2:
+                    safe_front_dist = 0.35  # need to move closer to grasp the object
+                elif self.target_tag == 1:
+                    safe_front_dist = 0.6 # need to stay a safe distance from users
+                else:
+                    safe_front_dist = 0.8 # more space from wall
+                if self.front_dist < safe_front_dist:
                     lin_x = 0.0
                     ang_z = 0.0
                     self.start_sequence = True
@@ -596,6 +602,12 @@ class FinalProject(Node):
             self.target_tag = 2
             self.pending_return_tag = 1
             self.current_task = 3
+
+        # Initialize Arm to initial position before conducting next task
+        joint_msg = ArmJointAngles(joint1=0.0, joint2=0.0, joint3=0.0, joint4=0.0)
+        self.arm_pub.publish(joint_msg)
+        time.sleep(2)
+        self.get_logger().info('Arm Initialized')
 
         self.next_goal = 1
         # Reset nav_mode when starting a new goal
