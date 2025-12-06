@@ -6,11 +6,21 @@ The goal of our project is to control a robot so that it performs different task
 
 We use **Computer Vision (CV)** and **Inverse Kinematics (IK)** as our main components. Using CV, we detect three hand gestures that map to three mood levels:
 
-  * **Fist (Low Mood):** The robot picks up an entertaining object and presents it to the user.
+  * **Open Palm (Low Mood):** The robot picks up an entertaining object and presents it to the user.
   * **V Sign (High Mood):** The robot performs a “dance” sequence.
-  * **Open Palm (Rest):** The robot navigates through obstacles to move to a designated rest position.
+  * **Fist (Rest):** The robot navigates through obstacles to move to a designated rest position.
 
 For the dancing and object-pickup behaviors, we use our IK solver to convert 3D target positions into joint angle configurations for the robot. Our IK solver has been tested under multiple conditions, including varying target heights and horizontal distances, and has been shown to produce reliable, executable motions. Together, these components form a pipeline where user gestures are interpreted as moods, which are then translated into expressive robot actions.
+
+## Demo
+**Fist (Rest):**
+<p align="center"> <img src="gesture0.gif""/> </p>
+
+**V Sign (High Mood):**
+<p align="center"> <img src="gesture2.gif"/> </p>
+
+**Open Palm (Low Mood):**
+<p align="center"> <img src="gesture5.gif"/> </p>
 
 ## System Architecture
 
@@ -50,6 +60,12 @@ Provides an inverse kinematics solver for the OpenMANIPULATOR arm.
 ![ROS Node Diagram](./ros2_node_diagram.png)
 
 ## Execution
+
+For Computer Vision Training part, we run the command:
+```bash
+ros2 run intro_to_robotics_final_project gesture-training
+```
+Then for executing the program:
 
 ### **[Terminal #1]** SSH into the robot, check USB port, and run bringup
 
