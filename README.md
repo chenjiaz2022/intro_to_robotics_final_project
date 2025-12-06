@@ -14,13 +14,13 @@ For the dancing and object-pickup behaviors, we use our IK solver to convert 3D 
 
 ## Demo
 **Fist (Rest):**
-<p align="center"> <img src="gesture0.gif""/> </p>
+<p align="center"> <img src="intro_to_robotics_final_project/gesture0.gif""/> </p>
 
 **V Sign (High Mood):**
-<p align="center"> <img src="gesture2.gif"/> </p>
+<p align="center"> <img src="intro_to_robotics_final_project/gesture2.gif"/> </p>
 
 **Open Palm (Low Mood):**
-<p align="center"> <img src="gesture5.gif"/> </p>
+<p align="center"> <img src="intro_to_robotics_final_project/gesture5.gif"/> </p>
 
 ## System Architecture
 
