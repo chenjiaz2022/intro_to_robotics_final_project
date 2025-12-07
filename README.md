@@ -67,7 +67,7 @@ ros2 run intro_to_robotics_final_project gesture-training
 ```
 Then for executing the program:
 
-### **[Terminal #1]** SSH into the robot, check USB port, and run bringup
+ * **[Terminal #1]** SSH into the robot, check USB port, and run bringup
 
 Set the robot number:
 
